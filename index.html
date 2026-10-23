@@ -2105,6 +2105,27 @@ const teacherLoginToEmail = (login) => {
   return s.replace(/[^a-z0-9._-]/g, '') + '@smartexam.app';
 };
 
+const authErrText = (e) => {
+  const code = (e && e.code) || '';
+  const m = {
+    'auth/email-already-in-use': 'Энэ нэр / имэйл аль хэдийн бүртгэлтэй байна. "Нэвтрэх" хэсгээр орно уу.',
+    'auth/invalid-email': 'Нэвтрэх нэр / имэйл буруу байна (латин үсэг, тоо ашиглана).',
+    'auth/weak-password': 'Нууц үг хэт богино. Дор хаяж 6 тэмдэгт оруулна уу.',
+    'auth/operation-not-allowed': 'Firebase Console → Authentication → Sign-in method дотор "Email/Password"-г идэвхжүүлнэ үү.',
+    'auth/network-request-failed': 'Интернет холболт тасарлаа. Дахин оролдоно уу.',
+    'auth/too-many-requests': 'Хэт олон оролдлого хийлээ. Түр хүлээгээд дахин оролдоно уу.',
+    'auth/user-not-found': 'Бүртгэл олдсонгүй. "Шинээр бүртгүүлэх" хэсгээр бүртгүүлнэ үү.',
+    'auth/wrong-password': 'Нэвтрэх нэр эсвэл нууц үг буруу байна.',
+    'auth/invalid-credential': 'Нэвтрэх нэр эсвэл нууц үг буруу байна.',
+    'auth/configuration-not-found': 'Firebase Authentication идэвхгүй байна.',
+    'auth/unauthorized-domain': 'Энэ домайныг Firebase Console → Authentication → Settings → Authorized domains-д нэмнэ үү.'
+  };
+  if (m[code]) return m[code];
+  const msg = (e && e.message) || '';
+  if (/PERMISSION_DENIED|permission.?denied/i.test(msg)) return 'Database-д бичих эрхгүй байна. database.rules.json-г Firebase Console → Realtime Database → Rules хэсэгт хуулж Publish хийнэ үү.';
+  return msg || 'Алдаа гарлаа';
+};
+
 const teacherSignIn = async (email, password) => {
   const auth = getAuth();
   if (!auth) throw new Error('Firebase Auth холбогдоогүй. Интернетээ шалгана уу.');
@@ -2117,25 +2138,26 @@ const teacherSignIn = async (email, password) => {
   return cred.user;
 };
 
-const teacherSignUp = async (email, password, displayName) => {
+const teacherSignUp = async (login, password, displayName) => {
   const auth = getAuth();
   if (!auth) throw new Error('Firebase Auth холбогдоогүй');
-  const cred = await auth.createUserWithEmailAndPassword(String(email).trim(), password);
-  if (displayName) {
-    try { await cred.user.updateProfile({ displayName: sanitizeText(displayName, 80) }); } catch {}
-  }
+  const email = teacherLoginToEmail(login);
+  if (!email) throw new Error('Нэвтрэх нэр оруулна уу');
+  const name = sanitizeText(displayName || String(login).split('@')[0], 80);
+  const cred = await auth.createUserWithEmailAndPassword(email, password);
+  try { await cred.user.updateProfile({ displayName: name }); } catch {}
   try { localStorage.setItem('se_role', 'teacher'); } catch {}
   const db = getDb();
+  let dbErr = null;
   if (db) {
     try {
-      await withAuthRetry(() => db.ref('users/' + cred.user.uid).set({ role: 'teacher', name: sanitizeText(displayName || email.split('@')[0], 80) }));
-      await db.ref('teachers/' + cred.user.uid).set({
-        displayName: sanitizeText(displayName || email.split('@')[0], 80),
-        email: String(email).trim().toLowerCase(),
-        createdAt: new Date().toISOString()
-      });
-    } catch {}
+      await withAuthRetry(() => db.ref('users/' + cred.user.uid).set({ role: 'teacher', name, email, createdAt: new Date().toISOString() }));
+    } catch (e) { dbErr = e; console.warn('users profile write failed', e); }
+    try {
+      await withAuthRetry(() => db.ref('teachers/' + cred.user.uid).set({ displayName: name, email, createdAt: new Date().toISOString() }));
+    } catch (e) { dbErr = dbErr || e; console.warn('teachers profile write failed', e); }
   }
+  if (dbErr) { try { cred.user.dbWarning = authErrText(dbErr); } catch {} }
   return cred.user;
 };
 
@@ -3038,6 +3060,8 @@ function LandingPage({ onSelect }) {
 
 // ─── TEACHER LOGIN (Firebase Auth) ───────────────────────────────────────────
 function TeacherLogin({ onLogin }) {
+  const [mode, setMode] = useState('login');
+  const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPass, setShowPass] = useState(false);
@@ -3046,25 +3070,23 @@ function TeacherLogin({ onLogin }) {
 
   const handle = async () => {
     setErr('');
+    if (mode === 'reg' && !fullName.trim()) { setErr('Овог нэрээ оруулна уу'); return; }
     if (!email.trim() || !password) { setErr('Нэвтрэх нэр болон нууц үг оруулна уу'); return; }
     if (password.length < 6) { setErr('Нууц үг дор хаяж 6 тэмдэгт'); return; }
     setBusy(true);
     try {
-      const user = await teacherSignIn(email, password);
-      const display = sanitizeText(user.displayName || email.split('@')[0], 80);
+      const user = mode === 'reg'
+        ? await teacherSignUp(email, password, fullName)
+        : await teacherSignIn(email, password);
+      if (user && user.dbWarning) { try { alert('Бүртгэл үүслээ, гэвч profile хадгалахад алдаа гарлаа:\n' + user.dbWarning); } catch {} }
+      const display = sanitizeText(user.displayName || fullName || email.split('@')[0], 80);
       try {
         localStorage.setItem(SE_TEACHER, display);
         if (window.SESecurity) SESecurity.saveTeacherMeta({ uid: user.uid, email: user.email, displayName: display });
       } catch {}
       onLogin(display, user);
     } catch (e) {
-      const code = e?.code || '';
-      if (code === 'auth/invalid-email') setErr('Нэвтрэх нэр буруу байна');
-      else if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') setErr('Нэвтрэх нэр эсвэл нууц үг буруу');
-      else if (code === 'auth/user-not-found') setErr('Бүртгэл олдсонгүй. Админ багшийн эрх үүсгэсэн эсэхийг шалгана уу.');
-      else if (code === 'auth/operation-not-allowed') setErr('Firebase Console-д Email/Password Auth идэвхжүүлнэ үү');
-      else if (code === 'auth/configuration-not-found') setErr('Firebase Authentication идэвхгүй байна.');
-      else setErr(e?.message || 'Нэвтрэхэд алдаа');
+      setErr(authErrText(e));
     } finally {
       setBusy(false);
     }
@@ -3077,22 +3099,29 @@ function TeacherLogin({ onLogin }) {
           <div style={{display:'flex',alignItems:'center',gap:10}}>
             <span style={{fontSize:'1.4rem'}}>🔐</span>
             <div>
-              <div style={{fontFamily:'Outfit',fontWeight:800,fontSize:'1.1rem'}}>Багшийн нэвтрэлт</div>
-              <div style={{fontSize:'0.8rem',color:'var(--text2)'}}>Админы үүсгэсэн нэр / нууц үг</div>
+              <div style={{fontFamily:'Outfit',fontWeight:800,fontSize:'1.1rem'}}>{mode === 'reg' ? 'Багш бүртгүүлэх' : 'Багшийн нэвтрэлт'}</div>
+              <div style={{fontSize:'0.8rem',color:'var(--text2)'}}>{mode === 'reg' ? 'Шинэ багшийн эрх үүсгэх' : 'Нэвтрэх нэр / нууц үгээ оруулна уу'}</div>
             </div>
           </div>
         </div>
         <div className="modal-body">
+          {mode === 'reg' && (
+            <div className="form-group">
+              <label className="form-label">Овог нэр</label>
+              <input className="form-input" autoComplete="name" placeholder="жишээ: Б.Болд"
+                value={fullName} onChange={e => setFullName(e.target.value)} autoFocus />
+            </div>
+          )}
           <div className="form-group">
             <label className="form-label">Нэвтрэх нэр</label>
             <input className="form-input" autoComplete="username" placeholder="жишээ: bagsh01"
-              value={email} onChange={e => setEmail(e.target.value)} autoFocus
+              value={email} onChange={e => setEmail(e.target.value)} autoFocus={mode !== 'reg'}
               onKeyDown={e => e.key === 'Enter' && !busy && handle()} />
           </div>
           <div className="form-group">
             <label className="form-label">Нууц үг</label>
             <div style={{display:'flex',gap:8}}>
-              <input className="form-input" type={showPass ? 'text' : 'password'} autoComplete="current-password"
+              <input className="form-input" type={showPass ? 'text' : 'password'} autoComplete={mode === 'reg' ? 'new-password' : 'current-password'}
                 placeholder="••••••••" value={password} onChange={e => setPassword(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && !busy && handle()} style={{flex:1}} />
               <button type="button" className="btn btn-outline btn-sm" onClick={() => setShowPass(s => !s)}>{showPass ? '🙈' : '👁'}</button>
@@ -3100,9 +3129,12 @@ function TeacherLogin({ onLogin }) {
           </div>
           {err && <div className="form-error">⚠ {err}</div>}
         </div>
-        <div className="modal-foot">
+        <div className="modal-foot" style={{flexWrap:'wrap',gap:8}}>
           <button className="btn btn-primary btn-lg" onClick={handle} disabled={busy}>
-            {busy ? '⏳ ...' : '▶ Нэвтрэх'}
+            {busy ? '⏳ ...' : (mode === 'reg' ? '✅ Бүртгүүлэх' : '▶ Нэвтрэх')}
+          </button>
+          <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { setErr(''); setMode(m => m === 'reg' ? 'login' : 'reg'); }}>
+            {mode === 'reg' ? 'Бүртгэлтэй юу? Нэвтрэх' : 'Шинээр бүртгүүлэх'}
           </button>
         </div>
       </div>
@@ -8890,36 +8922,46 @@ function StudentAuth({ onDone, onBack }) {
   const [busy, setBusy] = useState(false);
   const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
   const go = async () => {
-    setErr(''); setBusy(true);
+    setErr('');
+    const email = teacherLoginToEmail(f.email);
+    if (!email) { setErr('Нэвтрэх нэр эсвэл имэйлээ оруулна уу'); return; }
+    if (!f.password || f.password.length < 6) { setErr('Нууц үг дор хаяж 6 тэмдэгт байна'); return; }
+    setBusy(true);
     try {
       const auth = getAuth(), db = getDb();
+      if (!auth) throw new Error('Firebase Auth холбогдоогүй. Интернетээ шалгана уу.');
       if (mode === 'reg') {
         const name = sanitizeText(f.name, 80);
         if (!name) throw new Error('Нэрээ оруулна уу');
-        const c = await auth.createUserWithEmailAndPassword(f.email.trim(), f.password);
-        await c.user.updateProfile({ displayName: name });
-        await withAuthRetry(() => db.ref('users/' + c.user.uid).set({ role: 'student', name, email: f.email.trim().toLowerCase(), createdAt: new Date().toISOString() }));
-        localStorage.setItem('se_role', 'student'); onDone(name);
+        const c = await auth.createUserWithEmailAndPassword(email, f.password);
+        try { await c.user.updateProfile({ displayName: name }); } catch (_) {}
+        try { localStorage.setItem('se_role', 'student'); } catch (_) {}
+        // Profile бичилт амжилтгүй болсон ч бүртгэл үүссэн тул нэвтрэхийг зогсоохгүй
+        try { await withAuthRetry(() => db.ref('users/' + c.user.uid).set({ role: 'student', name, email, createdAt: new Date().toISOString() })); }
+        catch (e) { console.warn('student profile write failed', e); }
+        onDone(name);
       } else {
-        const c = await auth.signInWithEmailAndPassword(f.email.trim(), f.password);
-        const r = (await withAuthRetry(() => db.ref('users/' + c.user.uid + '/role').once('value'))).val();
+        const c = await auth.signInWithEmailAndPassword(email, f.password);
+        let r = null;
+        try { r = (await withAuthRetry(() => db.ref('users/' + c.user.uid + '/role').once('value'))).val(); } catch (_) {}
         if (r && r !== 'student') { await auth.signOut(); throw new Error('Энэ сурагчийн акаунт биш байна (багшийн нэвтрэлтээр орно уу)'); }
-        if (!r) { try { await withAuthRetry(() => db.ref('users/' + c.user.uid).set({ role: 'student', name: c.user.displayName || 'Сурагч', email: f.email.trim().toLowerCase(), createdAt: new Date().toISOString() })); } catch (_) {} }
-        localStorage.setItem('se_role', 'student'); onDone(c.user.displayName || 'Сурагч');
+        if (!r) { try { await withAuthRetry(() => db.ref('users/' + c.user.uid).set({ role: 'student', name: c.user.displayName || 'Сурагч', email, createdAt: new Date().toISOString() })); } catch (_) {} }
+        try { localStorage.setItem('se_role', 'student'); } catch (_) {}
+        onDone(c.user.displayName || 'Сурагч');
       }
-    } catch (e) { setErr(e.message || 'Алдаа гарлаа'); }
+    } catch (e) { setErr(authErrText(e)); }
     setBusy(false);
   };
   return (
     <div className="landing"><div className="card" style={{ width: '100%', maxWidth: 380 }}><div className="card-body">
       <h2 style={{ marginBottom: 14 }}>🎓 Сурагч {mode === 'reg' ? 'бүртгүүлэх' : 'нэвтрэх'}</h2>
-      {mode === 'reg' && <div className="form-group"><input className="form-input" placeholder="Овог нэр" value={f.name} onChange={set('name')} /></div>}
-      <div className="form-group"><input className="form-input" type="email" placeholder="Имэйл" value={f.email} onChange={set('email')} /></div>
-      <div className="form-group"><input className="form-input" type="password" placeholder="Нууц үг (6+)" value={f.password} onChange={set('password')} /></div>
-      {err && <div className="form-error">{err}</div>}
-      <button className="btn btn-violet" style={{ width: '100%', marginTop: 8 }} disabled={busy} onClick={go}>{mode === 'reg' ? 'Бүртгүүлэх' : 'Нэвтрэх'}</button>
+      {mode === 'reg' && <div className="form-group"><input className="form-input" autoComplete="name" placeholder="Овог нэр" value={f.name} onChange={set('name')} /></div>}
+      <div className="form-group"><input className="form-input" type="text" autoCapitalize="none" autoCorrect="off" autoComplete="username" placeholder="Нэвтрэх нэр эсвэл имэйл" value={f.email} onChange={set('email')} onKeyDown={e => e.key === 'Enter' && !busy && go()} /></div>
+      <div className="form-group"><input className="form-input" type="password" autoComplete={mode === 'reg' ? 'new-password' : 'current-password'} placeholder="Нууц үг (6+)" value={f.password} onChange={set('password')} onKeyDown={e => e.key === 'Enter' && !busy && go()} /></div>
+      {err && <div className="form-error">⚠ {err}</div>}
+      <button className="btn btn-violet" style={{ width: '100%', marginTop: 8 }} disabled={busy} onClick={go}>{busy ? '⏳ ...' : (mode === 'reg' ? 'Бүртгүүлэх' : 'Нэвтрэх')}</button>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12 }}>
-        <button className="btn btn-ghost btn-sm" onClick={() => setMode(mode === 'reg' ? 'login' : 'reg')}>{mode === 'reg' ? 'Нэвтрэх' : 'Шинээр бүртгүүлэх'}</button>
+        <button className="btn btn-ghost btn-sm" onClick={() => { setErr(''); setMode(mode === 'reg' ? 'login' : 'reg'); }}>{mode === 'reg' ? 'Нэвтрэх' : 'Шинээр бүртгүүлэх'}</button>
         <button className="btn btn-ghost btn-sm" onClick={onBack}>← Буцах</button>
       </div>
     </div></div></div>
@@ -8965,12 +9007,13 @@ function StudentHome({ name, onStart, onLogout }) {
   const join = async () => {
     const db = getDb();
     try {
-      const cid = (await db.ref('classCodes/' + code.trim().toUpperCase()).once('value')).val();
+      if (!db || !uidv) return alert('Нэвтрээгүй байна. Гараад дахин нэвтэрнэ үү.');
+      const cid = (await withAuthRetry(() => db.ref('classCodes/' + code.trim().toUpperCase()).once('value'))).val();
       if (!cid) return alert('Ангийн код буруу байна');
-      await db.ref('classMembers/' + cid + '/' + uidv).set({ name, at: new Date().toISOString() });
-      await db.ref('studentClasses/' + uidv + '/' + cid).set(true);
+      await withAuthRetry(() => db.ref('classMembers/' + cid + '/' + uidv).set({ name, at: new Date().toISOString() }));
+      await withAuthRetry(() => db.ref('studentClasses/' + uidv + '/' + cid).set(true));
       setCode('');
-    } catch (e) { alert('Нэгдэх алдаа: ' + (e.message || e)); }
+    } catch (e) { alert('Нэгдэх алдаа: ' + authErrText(e)); }
   };
   const tests = classes.flatMap(c => c.tests.map(t => ({ ...t, cls: c })));
   const start = async (t, onlyIds, label) => {
@@ -9422,7 +9465,7 @@ function AdminApp() {
               } catch (e) { alert(e.message); }
             }}>Үүсгэх</button>
           </div>
-          <div className="form-hint" style={{marginTop:8}}>Багш өөрөө бүртгүүлэх боломжгүй. Зөвхөн энд үүсгэсэн эрхээр нэвтэрнэ.</div>
+          <div className="form-hint" style={{marginTop:8}}>Багш өөрөө мөн нүүр хуудаснаас бүртгүүлж болно. Энд үүсгэсэн эрхээр ч нэвтэрнэ.</div>
           <table className="tbl" style={{marginTop:14}}><thead><tr><th>Нэвтрэх нэр</th><th>Нэр</th><th>UID</th></tr></thead>
             <tbody>{teachers.map(t => <tr key={t.login}><td>{t.login}</td><td>{t.name}</td><td style={{fontSize:'.75rem'}}>{t.uid}</td></tr>)}</tbody>
           </table>
