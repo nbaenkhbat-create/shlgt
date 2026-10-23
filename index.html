@@ -60,7 +60,8 @@ window.__SE_IS_QR__ = (location.hash || '').indexOf('#qr=') === 0;
       var roomID = packed && packed.r;
       var classKey = (packed && packed.c) || '';
       if (!roomID) return null;
-      var info = { roomID: roomID, classKey: classKey, t: Date.now() };
+      var cfg = (packed && packed.q) || null;
+      var info = { roomID: roomID, classKey: classKey, cfg: cfg, t: Date.now() };
       try { sessionStorage.setItem('se_qr_boot', JSON.stringify(info)); } catch (e) {}
       return info;
     } catch (e) { return null; }
@@ -72,6 +73,7 @@ window.__SE_IS_QR__ = (location.hash || '').indexOf('#qr=') === 0;
   window.__SE_QR_PREFETCH__ = {
     roomID: qr.roomID,
     classKey: qr.classKey || '',
+    cfg: qr.cfg || null,
     promise: authWarm.then(function (user) {
       if (!user) throw new Error('auth');
       var db = firebase.database(app);
@@ -660,7 +662,7 @@ if (window.pdfjsLib) {
           { key: 'A', text: q?.options?.[0]?.text || 'Зөв / Үнэн' },
           { key: 'B', text: q?.options?.[1]?.text || 'Буруу / Худал' }
         ];
-      } else if (type === 'grid' || type === 'blank' || type === 'open') {
+      } else if (type === 'grid' || type === 'blank' || type === 'open' || type === 'rewrite') {
         options = [];
       } else if (type === 'match') {
         options = (Array.isArray(q?.options) ? q.options : Object.values(q?.options || {})).map((o, oi) => ({ key: o?.key || 'ABCDEFGH'[oi], text: o?.text || '' }));
@@ -681,6 +683,11 @@ if (window.pdfjsLib) {
   const normBlank = (s) => String(s == null ? '' : s).toLowerCase().replace(/[\s.,;:!?"'«»()\-–—_]+/g, ' ').trim();
   const answersEqual = (got, expected, type) => {
     if (expected == null || expected === '') return false;
+  if (type === 'rewrite') {
+    const nr = (s) => String(s == null ? '' : s).replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/\s+/g, ' ').trim();
+    const gr = nr(got);
+    return gr.length > 0 && String(expected).split('|').map(nr).filter(Boolean).indexOf(gr) >= 0;
+  }
     if (type === 'blank') {
       // Нөхөх: том/жижиг, зай, тэмдэгт ялгахгүй. Хэд хэдэн зөв хариултыг "|"-ээр тусгаарлана
       const gb = normBlank(got);
@@ -2017,6 +2024,16 @@ img, svg, video, canvas { max-width: 100%; }
 .zgrow-sub { font-size: .8rem; color: var(--text2); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .zgrow-score { font: 800 1.2rem 'Outfit', sans-serif; }
 .zgrow-go { color: var(--text3); font-size: 1.4rem; line-height: 1; }
+/* ─── ШАЛГАЛТ: чит хамгаалалт + гар утасны тогтвортой байдал ─── */
+.exam-taking-root { overflow-x: clip; touch-action: pan-y pinch-zoom; }
+.exam-taking-root .question-block, .exam-taking-root .card, .exam-taking-root .ac-doc { transform: none !important; transition: none !important; animation: none !important; }
+.exam-taking-root.ac-on { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.exam-taking-root.ac-on input, .exam-taking-root.ac-on textarea { -webkit-user-select: text; user-select: text; }
+@media (max-width: 640px) {
+  .exam-taking-root .container-sm { padding: 10px 4px !important; max-width: 100% !important; }
+  .exam-taking-root .question-block { padding: 10px; }
+  .exam-taking-root .ac-doc { padding: 14px 10px !important; font-size: 0.96rem !important; line-height: 1.7 !important; border-radius: 0 !important; border-left: 0 !important; border-right: 0 !important; }
+}
 </style>
 </head>
 <body>
@@ -2128,19 +2145,46 @@ const teacherSignOut = async () => {
   if (auth) await auth.signOut();
 };
 
-// Дүгнэлтийг СЕРВЕР (server.js /api/grade) хийнэ: answerKeys хөтөч рүү огт ирэхгүй
+// Cloud Function ашигладаггүй тул дүгнэлтийг хөтөч дээр хийнэ (answerKeys-ийг Realtime DB-ээс уншина)
 const callGradeSubmission = async (payload) => {
-  const u = getAuth()?.currentUser;
-  if (!u) throw new Error('Нэвтрээгүй байна');
-  const idToken = await u.getIdToken();
-  const r = await fetch('/api/grade', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...payload, idToken })
+  const db = getDb();
+  if (!db) throw new Error('Firebase холбогдоогүй');
+  const room = roomRef(db, payload.roomId);
+  const keySnap = await room.child('answerKeys').once('value');
+  const allKeys = keySnap.val();
+  if (!allKeys) throw new Error('Answer key уншигдсангүй (DB rules шалгана уу)');
+  const label = payload.variantLabel;
+  const rawKeys = allKeys[label] || allKeys[Object.keys(allKeys)[0]];
+  const keyList = (Array.isArray(rawKeys) ? rawKeys : Object.values(rawKeys || {})).filter(Boolean);
+  const subset = Array.isArray(payload.subset) ? payload.subset : null;
+  const ans = payload.answers || {};
+  let correct = 0, total = 0;
+  const wrongIds = [];
+  keyList.forEach(q => {
+    if (q.answer == null || q.answer === '') return;
+    if (subset && !subset.includes(q.id)) return;
+    total++;
+    // grid / blank / mcq / tf / match бүгдийг нэг дүрмээр (answersEqual) шалгана
+    const ok = answersEqual(ans[q.id], q.answer, q.type);
+    if (ok) correct++; else wrongIds.push(q.id);
   });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || ('grade ' + r.status));
-  return data;
+  if (!total) throw new Error('Зөв хариултын түлхүүр хоосон байна');
+  const score = Math.round((correct / total) * 100);
+  const id = uid();
+  // Алдсан асуултаа дахин ажиллах үед өрөөний дүнд нэмэхгүй
+  if (!subset) {
+    try {
+      await room.child('submissions').child(id).set({
+        id, uid: getAuth()?.currentUser?.uid || null,
+        examId: payload.roomId, answers: ans, score, correctCount: correct, totalCount: total,
+        studentName: payload.studentName || '', studentClass: payload.studentClass || '',
+        variantLabel: label, studentVersion: label,
+        cheatLog: payload.cheatLog || [], timeSpentSec: payload.timeSpentSec || 0,
+        submittedAt: new Date().toISOString(), verified: true, gradedBy: 'client'
+      });
+    } catch (e) { console.warn('submission save failed', e); }
+  }
+  return { id, score, correctCount: correct, totalCount: total, wrongIds };
 };
 
 const useLS = (key, init) => {
@@ -2318,7 +2362,7 @@ const unpackQuestions = (questions) => {
       { key: 'A', text: q?.options?.[0]?.text || 'Зөв / Үнэн' },
       { key: 'B', text: q?.options?.[1]?.text || 'Буруу / Худал' }
     ];
-  } else if (type === 'grid' || type === 'blank' || type === 'open') {
+  } else if (type === 'grid' || type === 'blank' || type === 'open' || type === 'rewrite') {
     options = [];
   } else if (type === 'match') {
     options = (Array.isArray(q?.options) ? q.options : Object.values(q?.options || {})).map((o, oi) => ({ key: o?.key || 'ABCDEFGH'[oi], text: o?.text || '' }));
@@ -2422,7 +2466,7 @@ const MathField = ({ value, onChange, multiline, style, className, placeholder }
 };
 const defaultOptionsForType = (type) => {
   if (type === 'tf') return [{ key: 'A', text: 'Зөв / Үнэн' }, { key: 'B', text: 'Буруу / Худал' }];
-  if (type === 'grid' || type === 'blank' || type === 'open') return [];
+  if (type === 'grid' || type === 'blank' || type === 'open' || type === 'rewrite') return [];
   return [{ key: 'A', text: '' }, { key: 'B', text: '' }, { key: 'C', text: '' }, { key: 'D', text: '' }];
 };
 
@@ -2467,6 +2511,11 @@ const seedQuestion = (type = 'mcq') => ({
 const normBlank = (s) => String(s == null ? '' : s).toLowerCase().replace(/[\s.,;:!?"'«»()\-–—_]+/g, ' ').trim();
 const answersEqual = (got, expected, type) => {
   if (expected == null || expected === '') return false;
+  if (type === 'rewrite') {
+    const nr = (s) => String(s == null ? '' : s).replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/\s+/g, ' ').trim();
+    const gr = nr(got);
+    return gr.length > 0 && String(expected).split('|').map(nr).filter(Boolean).indexOf(gr) >= 0;
+  }
   if (type === 'blank') {
     const gb = normBlank(got);
     return gb.length > 0 && String(expected).split('|').map(normBlank).filter(Boolean).indexOf(gb) >= 0;
@@ -2518,14 +2567,15 @@ const isCheatExempt = (name) => {
   });
 };
 
-const SCORE_MODE_XLS = { best: 'Хамгийн өндөр', avg: 'Дундаж', last: 'Сүүлийн' };
-// Сурагч бүр нэг мөр: багшийн сонгосон горимоор (өндөр / дундаж / сүүлийн) эцсийн дүн. Алдсан асуулт/нэмэлт оролдлого тооцогдохгүй.
-const submissionResultRows = (subs, mode) => {
-  const m = ['best', 'avg', 'last'].includes(mode) ? mode : 'best';
+const SCORE_MODE_XLS = { best: 'Хамгийн өндөр', avg: 'Дундаж', last: 'Сүүлийн', min: 'Хамгийн бага' };
+// Сурагч бүр нэг мөр: багшийн сонгосон горимоор (өндөр / дундаж / сүүлийн / бага) эцсийн дүн. Алдсан асуулт/нэмэлт оролдлого тооцогдохгүй.
+// passFn(ref) → тухайн оролдлогын тэнцэх босго (заавал биш)
+const submissionResultRows = (subs, mode, passFn) => {
+  const m = ['best', 'avg', 'last', 'min'].includes(mode) ? mode : 'best';
   const groups = groupByStudent(markRetryAttempts(subs || []), m)
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'mn'));
   return [
-    ['Нэр', 'Анги', 'Хувилбар', 'Эцсийн дүн (%)', 'Оролдлогын тоо', 'Дүнгийн горим', 'Cheat (тоо)', 'Хугацаа', 'Огноо'],
+    ['Нэр', 'Анги', 'Хувилбар', 'Эцсийн дүн (%)', ...(passFn ? ['Төлөв'] : []), 'Оролдлогын тоо', 'Дүнгийн горим', 'Cheat (тоо)', 'Хугацаа', 'Огноо'],
     ...groups.map(g => {
       const r = g.ref || g.attempts[g.attempts.length - 1];
       return [
@@ -2533,6 +2583,7 @@ const submissionResultRows = (subs, mode) => {
         g.cls || '',
         (r.variantLabel || r.studentVersion || ''),
         g.score,
+        ...(passFn ? [g.score >= passFn(r) ? 'Тэнцсэн' : 'Тэнцээгүй'] : []),
         g.fullCount || g.attempts.length,
         SCORE_MODE_XLS[m],
         g.attempts.reduce((t, a) => t + (a.cheatLog || []).length, 0),
@@ -2543,7 +2594,7 @@ const submissionResultRows = (subs, mode) => {
   ];
 };
 
-const downloadExcelByClass = (baseName, subs, scoreMode) => {
+const downloadExcelByClass = (baseName, subs, scoreMode, passFn) => {
   const byClass = {};
   subs.forEach(s => {
     const cls = (s.studentClass || 'Ангигүй').trim() || 'Ангигүй';
@@ -2555,31 +2606,56 @@ const downloadExcelByClass = (baseName, subs, scoreMode) => {
 
   if (typeof XLSX !== 'undefined') {
     const wb = XLSX.utils.book_new();
-    classKeys.forEach(cls => {
-      const rows = submissionResultRows(byClass[cls], scoreMode);
+    const mk = (rows) => {
       const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws['!cols'] = rows[0].map((h, ci) => ({ wch: Math.min(34, Math.max(String(h).length + 2, ...rows.slice(1).map(r => String(r[ci] == null ? '' : r[ci]).length + 2))) }));
+      return ws;
+    };
+    // 1-р хуудас: бүх анги нэг дор (анги, нэрээр эрэмбэлсэн)
+    if (classKeys.length > 1) {
+      const all = submissionResultRows(subs, scoreMode, passFn);
+      const head = all[0], data = all.slice(1).sort((x, y) => String(x[1]).localeCompare(String(y[1]), 'mn') || String(x[0]).localeCompare(String(y[0]), 'mn'));
+      XLSX.utils.book_append_sheet(wb, mk([head, ...data]), 'Бүх анги');
+    }
+    classKeys.forEach(cls => {
+      const rows = submissionResultRows(byClass[cls], scoreMode, passFn);
       const sheetName = cls.replace(/[\\/*?:\[\]]/g, '_').slice(0, 31) || 'Angi';
-      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+      XLSX.utils.book_append_sheet(wb, mk(rows), sheetName);
     });
     XLSX.writeFile(wb, (baseName.endsWith('.xlsx') ? baseName : baseName + '.xlsx'));
     return;
   }
   classKeys.forEach(cls => {
-    downloadCSV(baseName + '_' + cls.replace(/[\\/:*?"<>|]+/g, '_'), submissionResultRows(byClass[cls], scoreMode));
+    downloadCSV(baseName + '_' + cls.replace(/[\\/:*?"<>|]+/g, '_'), submissionResultRows(byClass[cls], scoreMode, passFn));
   });
 };
 
 // ─── QR PAYLOAD (compact) ─────────────────────────────────────────────────────
 // Keep QR short enough to be reliably scannable.
-const packExamForQR = (exam, classKey) => ({
+const packExamForQR = (exam, classKey, cfg) => ({
   r: exam.id,
-  c: classKey || ''
+  c: classKey || '',
+  ...(cfg ? { q: cfg } : {})
 });
 
+// QR-д суулгасан тохиргоо (k: e=шалгалт / p=дасгал, d: минут, p: босго %, m: дүнгийн горим, a: оролдлогын тоо, ac: чит хамгаалалт, i: QR-ийн id)
+const applyQrCfg = (exam, cfg) => {
+  if (!cfg || !exam) return exam;
+  const o = { ...exam, qrCfg: cfg, qrKind: cfg.k === 'p' ? 'practice' : 'exam', qrLink: cfg.i || '' };
+  if (cfg.d != null && Number.isFinite(+cfg.d)) o.duration = Math.max(0, +cfg.d);
+  if (cfg.p != null && Number.isFinite(+cfg.p)) o.passingScore = +cfg.p;
+  if (cfg.m) o.scoreMode = cfg.m;
+  if (cfg.a != null && Number.isFinite(+cfg.a)) o.maxAttempts = Math.max(0, +cfg.a);
+  if (cfg.ac != null) o.antiCheat = !!+cfg.ac;
+  return o;
+};
+
+const ANY_CLASS = 'Бүх анги';
 const unpackExamFromQR = (packed) => {
   return ({
     roomID: packed?.r || null,
-    classKey: normalizeClassKey(packed?.c || '')
+    classKey: normalizeClassKey(packed?.c || ''),
+    cfg: packed?.q || null
   });
 };
 
@@ -3536,7 +3612,7 @@ const parseQuestionsLocalBase = (rawText) => {
     }
     srcMode = false; explicitSrc = false;
     out.push(cur);
-    if (secType === 'blank' || secType === 'tf' || secType === 'open') cur.type = secType;
+    if (secType === 'rewrite' || secType === 'blank' || secType === 'tf' || secType === 'open') cur.type = secType;
     else if (secType === 'match') {
       cur.type = 'match'; cur.left = []; cur.right = []; cur._matching = true; cur._side = '';
       if ((rest || '').trim()) { cur.left.push(String(rest).trim()); cur.text = 'Холбох'; }
@@ -3674,7 +3750,7 @@ const finalizeImportedQuestions = (list) => {
     if (type === 'mcq' && filled === 0 && /оноо|тооцоол|тайлбарл|батал|зур(на|ж)/i.test(q.text || '')) type = 'open';
     let options;
     if (type === 'tf') options = defaultOptionsForType('tf');
-    else if (type === 'grid' || type === 'blank' || type === 'open') options = [];
+    else if (type === 'grid' || type === 'blank' || type === 'open' || type === 'rewrite') options = [];
     else {
       options = (String(((optsIn.find((o) => o.key === 'E') || optsIn[4] || {}).text || '')).trim() ? ['A', 'B', 'C', 'D', 'E'] : ['A', 'B', 'C', 'D']).map((key, oi) => {
         const hit = optsIn.find((o) => o.key === key) || optsIn[oi];
@@ -3684,7 +3760,7 @@ const finalizeImportedQuestions = (list) => {
     let answer = q.answer ?? q.numericAnswer ?? null;
     if (type === 'open') {
       answer = null;   // задгай даалгаврыг автоматаар шалгахгүй (багш гараар дүгнэнэ)
-    } else if (answer != null && type === 'blank') {
+    } else if (answer != null && (type === 'blank' || type === 'rewrite')) {
       answer = String(answer).trim().slice(0, 200) || null;
     } else if (answer != null && type === 'tf') {
       answer = tfToken(answer);
@@ -4048,12 +4124,13 @@ const scanMapQuiz = (raw, passageOverride) => {
     if (['fill', 'fill_in', 'blank'].includes(type)) type = 'blank';
     if (['matching', 'match'].includes(type)) type = 'match';
     if (['truefalse', 'tf', 'true_false'].includes(type)) type = 'tf';
+    if (['rewrite', 'punctuation', 'combine', 'rewriting'].includes(type)) type = 'rewrite';
     if (['open', 'essay', 'written', 'free', 'long', 'short_answer', 'open_ended', 'constructed'].includes(type)) type = 'open';
     const text = scanFixTerms(String(q.text || q.question || q.instruction || '')).trim();
     const rawLeft = Array.isArray(q.left) ? q.left : [];
     if (!text && !(type === 'match' && rawLeft.length >= 2)) return;
     const item = {
-      id: out.length + 1, text: (text || 'Холбох').slice(0, 2000), type, topic: String(q.topic || '').slice(0, 120),
+      id: out.length + 1, text: (text || 'Холбох').slice(0, 2000), type, topic: (/^[IVX]+\./.test(String(q.topic || '').trim()) ? '\u00a7' : '') + String(q.topic || '').slice(0, 118),
       imageUrl: '', sourceText: String(q.sourceText || q.context || '').slice(0, 4000), audioUrl: '', unit: '',
       left: [], options: [], answer: null, numericAnswer: null,
       _n: (q.n != null && isFinite(+q.n)) ? +q.n : null
@@ -4071,6 +4148,9 @@ const scanMapQuiz = (raw, passageOverride) => {
     } else if (type === 'tf') {
       item.options = [{ key: 'A', text: 'Зөв / Үнэн' }, { key: 'B', text: 'Буруу / Худал' }];
       item.answer = tfToken(q.answer);
+    } else if (type === 'rewrite') {
+      item.type = 'rewrite'; item.options = [];
+      item.answer = q.answer != null && String(q.answer).trim() ? String(q.answer).slice(0, 400) : null;
     } else if (type === 'open') {
       item.type = 'open'; item.options = []; item.answer = null;
     } else if (type === 'blank' || type === 'grid') {
@@ -4113,6 +4193,9 @@ const scanMapQuiz = (raw, passageOverride) => {
   }
   const nums = out.map((o) => o._n);
   out.forEach((o) => { delete o._n; });
+  // Англи хэлний шалгалт бүр (шинэ шалгалт, шинэ хувилбар) заавал баримт хэлбэрээр гарна
+  const cyr = out.filter(x => /[\u0400-\u04FF]/.test(String(x.text || ''))).length;
+  if (out.length && cyr < out.length / 2) out.forEach(x => { if (String(x.topic || '').charAt(0) !== '\u00a7') x.topic = '\u00a7' + String(x.topic || '').slice(0, 118); });
   return { title, nums, questions: typeof finalizeImportedQuestions === 'function' ? finalizeImportedQuestions(out) : out };
 };
 
@@ -4124,8 +4207,9 @@ const SCAN_PROMPT = [
   '{"title":"","passage":"","questions":[{"n":1,"text":"","context":"","type":"mcq","options":["","","",""],"left":[],"right":[],"answer":""}],"figures":[{"image":1,"box":[0,0,0,0],"questions":[1]}]}',
   'RULES',
   '1. Keep the printed order. "n" = printed question number. "text" = ONLY that question own words (no number, no answer options, never words from a neighbouring question). Keep dotted blanks "......" where printed.',
-  '2. "type": "mcq" = choose one; options = every printed option text in order (A,B,C,D, and E if printed) WITHOUT the letters. Return exactly as many options as are printed: 4 if only A-D exist, 5 if A-E exist; never invent an empty E. "blank" = gap to fill (gerund, chart cell, complete the sentence), options []. "tf" = true/false, options [], answer "A" true / "B" false only if printed. "match" = TWO COLUMNS that must be linked: left = numbered items WITHOUT numbers, right = lettered items WITHOUT letters, text = the instruction only (e.g. "Match the words to their definitions"). Never dump left+right into "text". Never treat "1. To devote   a. a book..." as mcq options. If a section is Match/definitions, ONE match question with ALL left items and ALL right items. "open" = written task (punctuation, combine sentences, calculate, explain), options [], answer "". Chart/table (Country / Nationality / Language): one blank per missing cell; text like "Row 2 Nationality" plus any given cell values in context.',
-  '3. "answer" only when an answer key is clearly printed, else "". Never solve anything.',
+  '2. "type": "mcq" = choose one; options = every printed option text in order (A,B,C,D, and E if printed) WITHOUT the letters. Return exactly as many options as are printed: 4 if only A-D exist, 5 if A-E exist; never invent an empty E. "blank" = gap to fill (gerund, chart cell, complete the sentence), options []. "tf" = true/false, options [], answer "A" true / "B" false only if printed. "match" = TWO COLUMNS that must be linked: left = numbered items WITHOUT numbers, right = lettered items WITHOUT letters, text = the instruction only (e.g. "Match the words to their definitions"). Never dump left+right into "text". Never treat "1. To devote   a. a book..." as mcq options. If a section is Match/definitions, ONE match question with ALL left items and ALL right items. "rewrite" = student rewrites a whole sentence (add punctuation and capitals, or combine two sentences with the given word such as so that / in order to): text = the ORIGINAL sentence(s) exactly as printed including the word in brackets, options [], answer = the correct full sentence. "open" = other written task (calculate, explain, translate), options [], answer "". Chart/table (Country / Nationality / Language): one blank per missing cell; text like "Row 2 Nationality" plus any given cell values in context.',
+  '3. "answer": for physics/chemistry/math only when an answer key is printed, else empty, never solve. EXCEPTION for ENGLISH grammar exams: ALWAYS fill answer with the correct key (blank = the word, several accepted forms separated by |; mcq = letter; match = letters like B,A,C; rewrite = full sentence; chart cell = the word). Teacher will verify.',
+  'ENGLISH EXAM STRUCTURE: Roman numeral sections (I, II, III...) each have an instruction and points. The output must look IDENTICAL to the printed exam. For EVERY question set "topic" = the section heading copied EXACTLY as printed, with Roman numeral, instruction and points, e.g. "II. Match the words to their definitions /4 points/" (max 110 chars), the same text for all items of that section. Keep the original wording of every sentence unchanged (no translating, no fixing, no shortening). Every gap, including an EMPTY SPACE gap or dotted gap, must be written as "....." at its exact position in text, and the verb in brackets stays where printed. Make ONE question per numbered item, except match = one question for the whole section. A sentence with an underlined or italic choice like will/shall or steal/stealing = mcq with those words as options A and B (answer is the letter) and in text write the choice at its exact position as {will/shall}, e.g. "{will/shall} you help me to open this door?". Unjumble/anagram (JATORNI) = blank, text = JATORNI (exactly as printed). TABLE or CHART section: for each missing cell make one blank with text = TABLE|rowNo|ColumnName|Header1;Header2;Header3|cell1;cell2;cell3 where the last part lists the printed row values in column order and an EMPTY string for every missing cell, e.g. TABLE|1|Nationality|Country;Nationality;Language|Germany;;  and answer = the missing word. Create nouns by endings = blank, text = Beauty. A sentence with a gap and a verb in brackets = blank, keep the dotted gap in text; if a sentence has two gaps make two questions, each text marks its own gap as ____ and shows the other gap solved. Decide gradual change vs present action = mcq with options Gradual change (GC), Present action (PA). Translate = open.',
   '4. "passage" = long source text printed before the questions ("" if none). "context" = shared data used by several questions (e.g. "63-65-р даалгаврын өгөгдөл: ..."), copied into EVERY question of the group without the heading.',
   '5. Open task with sub-parts а) б) в): one question per sub-part; shared stem goes into "context"; "text" starts with the sub-part letter and keeps printed points; continue the running n.',
   '6. IGNORE: the bubble answer sheet, Name/Date box, ZipGrade logos, black corner squares, section headings, page numbers, and ALL handwriting (circles, ticks, underlines, connecting lines, pen scores). Handwriting is never an answer.',
@@ -5206,8 +5290,144 @@ function ImageCropModal({ src, onApply, onClose }) {
   );
 }
 
+const DocCollapse = ({ on, children }) => on ? (
+  <details style={{marginTop:14,border:'1px dashed var(--border)',borderRadius:8,padding:'8px 12px',background:'white'}}>
+    <summary style={{cursor:'pointer',fontWeight:600,color:'var(--text2)'}}>Нарийвчилсан засвар (скан буруу уншсан текстийг засах үед л нээнэ)</summary>
+    <div style={{marginTop:12}}>{children}</div>
+  </details>
+) : <>{children}</>;
+
+const isDocExam = (qs) => (qs || []).some(q => /^(\u00a7|[IVX]+\.)/.test(String(q.topic || '')));
+
+function DocPaper({ questions, answers, setAnswers, keyMode }) {
+  // class ac-doc: утсан дээр илүү өргөн, жижиг үсэг
+  const set = (id, v) => setAnswers(a => ({ ...a, [id]: v }));
+  const GAP = /(\.{3,}|\u2026+|_{2,})/;
+  const clean = (s) => String(s || '').replace(/^\s*\d+[.)]\s*/, '').replace(/^\s*unjumble:?\s*/i, '');
+  const line = { border: 0, borderBottom: '1.5px solid #222', background: 'transparent', font: 'inherit', color: 'inherit', padding: '0 4px', outline: 'none', textAlign: 'center' };
+  const secs = []; let n = 0;
+  questions.forEach((q) => {
+    const t = String(q.topic || '').replace(/^\u00a7/, '');
+    let s = secs[secs.length - 1];
+    if (!s || (t && t !== s.t)) { s = { t, items: [] }; secs.push(s); n = 0; }
+    s.items.push({ q, no: ++n });
+  });
+  const inp = (q, w) => (
+    <input style={{ ...line, ...(keyMode ? { background: '#dcfce7', borderBottomColor: '#16a34a' } : {}), minWidth: w || 120, width: w || 140 }} value={answers[q.id] || ''} autoComplete="off"
+      autoCapitalize="off" spellCheck={false} onChange={e => set(q.id, e.target.value)} />
+  );
+  const area = (q, h) => (
+    <textarea className="form-textarea" style={{ minHeight: h, fontFamily: 'inherit', fontSize: 'inherit', ...(keyMode ? { background: '#dcfce7', borderColor: '#16a34a' } : {}) }} spellCheck={false}
+      value={answers[q.id] != null ? answers[q.id] : (q.type === 'rewrite' ? (q.text || '') : '')}
+      onChange={e => set(q.id, e.target.value)} />
+  );
+  const row = { margin: '4px 0 4px 18px' };
+  const docBlocks = (items) => {
+    const out = [];
+    items.forEach((it) => {
+      const p = String(it.q.text || '').split('|');
+      if (p[0].trim() === 'TABLE' && p.length >= 5) {
+        const heads = p[3].split(';').map(x => x.trim()), cells = p[4].split(';').map(x => x.trim());
+        const ci = heads.findIndex(h => h.toLowerCase() === p[2].trim().toLowerCase());
+        let b = out[out.length - 1];
+        if (!b || !b.tbl) { b = { tbl: true, key: 'tb' + it.q.id, heads, rows: {} }; out.push(b); }
+        const rk = p[1].trim();
+        const r = b.rows[rk] || (b.rows[rk] = { cells, blanks: {} });
+        if (ci >= 0) r.blanks[ci] = it.q;
+        return;
+      }
+      if (it.q.sourceText || it.q.imageUrl) out.push({ pre: true, key: 'pre' + it.q.id, q: it.q });
+      out.push(it);
+    });
+    return out;
+  };
+  const th = { border: '1px solid #222', padding: '2px 10px', textAlign: 'left', fontWeight: 700 };
+  const tdS = { border: '1px solid #222', padding: '2px 8px' };
+  const renderTable = (b) => (
+    <div key={b.key} style={{ overflowX: 'auto', margin: '6px 0' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 420 }}>
+        <thead><tr><th style={{ ...th, width: 28 }}></th>{b.heads.map((h, i) => <th key={i} style={th}>{h}</th>)}</tr></thead>
+        <tbody>
+          {Object.keys(b.rows).map((rk) => (
+            <tr key={rk}>
+              <td style={tdS}>{rk}</td>
+              {b.heads.map((h, ci) => {
+                const bq = b.rows[rk].blanks[ci];
+                return <td key={ci} style={tdS}>{bq ? inp(bq, 110) : b.rows[rk].cells[ci]}</td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+  return (
+    <div className="ac-doc" style={{ background: '#fff', color: '#111', fontFamily: '"Times New Roman", Times, serif', fontSize: '1.1rem', lineHeight: 1.9, padding: '26px 24px', border: '1px solid var(--border)', borderRadius: 6 }}>
+      {secs.map((s, si) => (
+        <div key={si} style={{ marginBottom: 20 }}>
+          {s.t && <div style={{ fontWeight: 700, marginBottom: 4 }}>{s.t}</div>}
+          {docBlocks(s.items).map((bk) => {
+            if (bk.tbl) return renderTable(bk);
+            if (bk.pre) return (
+              <div key={bk.key} style={{ margin: '8px 0', padding: '8px 12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6, whiteSpace: 'pre-wrap' }}>
+                {bk.q.imageUrl ? <img src={bk.q.imageUrl} alt="" style={{ maxWidth: '100%', display: 'block', marginBottom: 6 }} /> : null}{bk.q.sourceText}
+              </div>);
+            const { q, no } = bk;
+            const type = q.type || 'mcq';
+            if (type === 'match') return (
+              <div key={q.id} style={{ margin: '8px 0' }}><div>{clean(q.text)}</div>
+                <MatchPlayer q={q} value={answers[q.id]} onChange={(v) => set(q.id, v)} /></div>);
+            if (type === 'rewrite') return <div key={q.id} style={row}><div>{no}.</div>{area(q, 84)}</div>;
+            if (type === 'open') return <div key={q.id} style={row}><div>{no}. {clean(q.text)}</div>{area(q, 84)}</div>;
+            if (type === 'blank' || type === 'grid') {
+              const parts = clean(q.text).split(GAP).filter((x, i) => i % 2 === 0 || false);
+              const hasGap = GAP.test(clean(q.text));
+              if (hasGap) {
+                const segs = clean(q.text).split(GAP);
+                return <div key={q.id} style={row}>{no}. {segs[0]}{inp(q, 150)}{segs.slice(2).join(' ')}</div>;
+              }
+              return <div key={q.id} style={row}>{no}. {clean(q.text)} {inp(q, 200)}</div>;
+            }
+            const opts0 = q.options || [];
+            const ct0 = clean(q.text), mm = /\{([^{}]+)\}/.exec(ct0);
+            if (mm && opts0.length > 1) return (
+              <div key={q.id} style={row}>{no}. {ct0.slice(0, mm.index)}
+                {opts0.map((o, oi) => (
+                  <span key={o.key}>{oi > 0 ? ' / ' : ''}
+                    <button type="button" onClick={() => set(q.id, o.key)}
+                      style={{ font: 'inherit', fontStyle: 'italic', background: answers[q.id] === o.key ? (keyMode ? '#86efac' : '#dbeafe') : (keyMode ? '#dcfce7' : 'transparent'), border: 0,
+                        borderBottom: answers[q.id] === o.key ? '2px solid #1d4ed8' : '1.5px dotted #888', padding: '0 4px', cursor: 'pointer', color: 'inherit' }}>{o.text}</button>
+                  </span>
+                ))}
+                {ct0.slice(mm.index + mm[0].length)}
+              </div>);
+            const opts = q.options || [];
+            const short = opts.length <= 3 && opts.every(o => String(o.text || '').length <= 16);
+            return (
+              <div key={q.id} style={row}>
+                {no}. {clean(q.text)}{' '}
+                <span style={{ display: short ? 'inline' : 'block' }}>
+                  {opts.map((o, oi) => (
+                    <button type="button" key={o.key} onClick={() => set(q.id, o.key)}
+                      style={{ font: 'inherit', background: answers[q.id] === o.key ? (keyMode ? '#86efac' : '#dbeafe') : (keyMode ? '#dcfce7' : 'transparent'), border: 0,
+                        borderBottom: answers[q.id] === o.key ? '2px solid #1d4ed8' : '1.5px dotted #888', margin: '0 10px 0 0', padding: '0 6px', cursor: 'pointer', color: 'inherit', display: short ? 'inline' : 'block', textAlign: 'left' }}>
+                      {short ? '' : o.key + ') '}{o.text}
+                    </button>
+                  ))}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function QuestionEditor({ questions, onChange, defaultType = 'mcq', subjectFeatures = [] }) {
   const [cropIdx, setCropIdx] = useState(null);
+  const [pvAns, setPvAns] = useState({});
+  const [pvKey, setPvKey] = useState(false);
   const setQ = (idx, field, val) => {
     const next = questions.map((q, i) => i === idx ? {...q, [field]: val} : q);
     onChange(next);
@@ -5244,11 +5464,39 @@ function QuestionEditor({ questions, onChange, defaultType = 'mcq', subjectFeatu
 
   return (
     <div>
+      {questions.length > 0 && (() => {
+        const on = isDocExam(questions);
+        if (!on) return null;
+        return (
+          <div className="form-hint" style={{marginBottom:12,padding:'10px 12px',border:'1px solid var(--border)',borderRadius:8,background:'white'}}>
+            {on && (
+              <div style={{marginTop:12}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8,flexWrap:'wrap',gap:8}}>
+                  <strong>Сурагчид харагдах байдал (урьдчилан харах)</strong>
+                  <label style={{display:'flex',gap:6,alignItems:'center',cursor:'pointer'}}>
+                    <input type="checkbox" checked={pvKey} onChange={e => setPvKey(e.target.checked)} /> Зөв хариулт бөглөх / шалгах (ногоон)
+                  </label>
+                </div>
+                {pvKey && <div className="form-hint" style={{marginBottom:8,color:'#15803d',fontWeight:600}}>Ногоон нүднүүдэд зөв хариултаа бичих эсвэл сонгоно уу. Автоматаар хадгалагдана. Орчуулга (задгай) даалгаврыг багш гараар шалгана.</div>}
+                <DocPaper questions={questions} keyMode={pvKey}
+                  answers={pvKey ? Object.fromEntries(questions.map(q => [q.id, q.type === 'open' ? '' : (q.answer == null || q.answer === '' ? (q.type === 'rewrite' || q.type === 'blank' ? (q.type === 'blank' ? '' : null) : null) : String(q.answer))])) : pvAns}
+                  setAnswers={(fn) => {
+                    if (!pvKey) { setPvAns(fn); return; }
+                    const cur = Object.fromEntries(questions.map(q => [q.id, q.type === 'open' ? '' : (q.answer == null || q.answer === '' ? (q.type === 'blank' ? '' : null) : String(q.answer))]));
+                    const nxt = fn(cur);
+                    onChange(questions.map(q => (q.type !== 'open' && nxt[q.id] !== cur[q.id]) ? {...q, answer: nxt[q.id] === '' ? null : nxt[q.id]} : q));
+                  }} />
+              </div>
+            )}
+          </div>
+        );
+      })()}
       {cropIdx != null && questions[cropIdx] && questions[cropIdx].imageUrl && (
         <ImageCropModal src={questions[cropIdx].imageUrl}
           onApply={(url) => { setQ(cropIdx, 'imageUrl', url); setCropIdx(null); }}
           onClose={() => setCropIdx(null)} />
       )}
+      <DocCollapse on={isDocExam(questions)}>
       {questions.length > 0 && (
         <div className="source-box" style={{marginBottom:16}}>
           <label className="form-label" style={{color:'#92400e'}}>📖 Эх бичвэр (шалгалтын эхэнд харагдана · заавал биш)</label>
@@ -5268,6 +5516,7 @@ function QuestionEditor({ questions, onChange, defaultType = 'mcq', subjectFeatu
                 <option value="mcq">Сонгох (A–D)</option>
                 <option value="blank">Нөхөх (бичиж хариулах)</option>
                 <option value="open">Задгай даалгавар (бичгээр)</option>
+                <option value="rewrite">Өгүүлбэр засах / нийлүүлэх (цэг таслал, so that)</option>
                 <option value="match">Холбох</option>
                 <option value="tf">Үнэн / Худал</option>
                 <option value="grid">Grid-in (тоон)</option>
@@ -5308,8 +5557,8 @@ function QuestionEditor({ questions, onChange, defaultType = 'mcq', subjectFeatu
             <div className="form-row" style={{marginBottom:8}}>
               <div className="form-group" style={{marginBottom:0}}>
                 <label className="form-label">Сэдэв (анализд)</label>
-                <input className="form-input" placeholder="жн: Ионы холбоо" value={q.topic || ''}
-                  onChange={e => setQ(qi, 'topic', e.target.value)} />
+                <input className="form-input" placeholder="жн: Ионы холбоо" value={String(q.topic || '').replace(/^\u00a7/, '')}
+                  onChange={e => setQ(qi, 'topic', (String(q.topic || '').charAt(0) === '\u00a7' ? '\u00a7' : '') + e.target.value)} />
               </div>
               {subjectFeatures.includes('unit') && (
                 <div className="form-group" style={{marginBottom:0}}>
@@ -5326,7 +5575,7 @@ function QuestionEditor({ questions, onChange, defaultType = 'mcq', subjectFeatu
               <MatchEditor q={q} onChange={(patch) => onChange(questions.map((qq, i) => i === qi ? {...qq, ...patch} : qq))} />
             ) : type === 'open' ? (
               <div className="form-hint" style={{marginBottom:10}}>✍ Задгай даалгавар: сурагч хариултаа бичгээр өгнө. Автоматаар шалгахгүй, багш гараар дүгнэнэ.</div>
-            ) : type === 'blank' ? (
+            ) : (type === 'blank' || type === 'rewrite') ? (
               <div style={{marginBottom:10}}>
                 <label className="form-label">Зөв хариулт (нөхөх үг)</label>
                 <input className="form-input" placeholder="жн: Улаанбаатар | УБ" value={q.answer || ''}
@@ -5376,6 +5625,7 @@ function QuestionEditor({ questions, onChange, defaultType = 'mcq', subjectFeatu
       <button className="btn btn-outline" style={{width:'100%',justifyContent:'center',padding:'11px'}} onClick={addQ}>
         + Асуулт нэмэх
       </button>
+      </DocCollapse>
     </div>
   );
 }
@@ -5513,7 +5763,7 @@ function CreateExam({ onSave, onCancel, initialExam, hasResults }) {
           omrFormat: info.omrFormat,
           omrMode: info.omrMode || profile?.omrMode || 'mcq',
           maxAttempts: Math.max(0, Math.min(20, +info.maxAttempts || 0)),
-          scoreMode: ['best', 'avg', 'last'].includes(info.scoreMode) ? info.scoreMode : 'best',
+          scoreMode: ['best', 'avg', 'last', 'min'].includes(info.scoreMode) ? info.scoreMode : 'best',
           ownerUid: teacher.uid,
           variants: normalizedVariants.length ? normalizedVariants : [{ label: 'A', questions: [] }],
           createdAt: editing ? (initialExam.createdAt || new Date().toISOString()) : new Date().toISOString(),
@@ -5667,6 +5917,7 @@ function CreateExam({ onSave, onCancel, initialExam, hasResults }) {
                     <option value="best">Хамгийн өндөр дүнгээр</option>
                     <option value="avg">Дундажаар</option>
                     <option value="last">Сүүлийн дүнгээр</option>
+                    <option value="min">Хамгийн бага дүнгээр</option>
                   </select>
                 </div>
               </div>
@@ -5834,6 +6085,209 @@ function CreateExam({ onSave, onCancel, initialExam, hasResults }) {
 
 
 // ─── QR MODAL ─────────────────────────────────────────────────────────────────
+const QR_MODE_OPTS = [['best', 'Хамгийн өндөр дүнгээр'], ['avg', 'Дундажаар'], ['last', 'Сүүлийн дүнгээр'], ['min', 'Хамгийн бага дүнгээр']];
+const qrCfgSummary = (c) => (c.k === 'p' ? '📝 Дасгал' : '🎓 Шалгалт') + ' · ' + (c.d > 0 ? c.d + ' мин' : 'цаггүй') + ' · босго ' + c.p + '% · '
+  + ((QR_MODE_OPTS.find(x => x[0] === c.m) || [])[1] || 'өндөр') + ' · ' + (c.a > 0 ? c.a + ' оролдлого' : 'оролдлого хязгааргүй');
+
+// «QR» цэс: шалгалтын материалаас шууд QR үүсгэнэ. Багш шалгалт / дасгал сонгоно. Сурагч уншуулахад анги + нэр 2-ыг заавал бичиж эхэлнэ.
+function QRHubModal({ exam, onClose, onOpenResults, onSaveLinks, onLegacy }) {
+  const defaults = (k) => k === 'p'
+    ? { d: 0, p: exam.passingScore ?? 60, m: 'best', a: 0, ac: 0 }
+    : { d: examDurationOf(exam), p: exam.passingScore ?? 60, m: exam.scoreMode || 'best', a: exam.maxAttempts > 0 ? exam.maxAttempts : 0, ac: exam.antiCheat !== false ? 1 : 0 };
+  const [kind, setKind] = useState('e');
+  const [f, setF] = useState(() => defaults('e'));
+  const [links, setLinks] = useState(() => Array.isArray(exam.qrLinks) ? exam.qrLinks : []);
+  const [cur, setCur] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const qrRef = useRef(null);
+
+  const pickKind = (k) => { setKind(k); setF(defaults(k)); };
+  const setField = (key) => (e) => setF(p => ({ ...p, [key]: e.target.type === 'checkbox' ? (e.target.checked ? 1 : 0) : e.target.value }));
+  const urlOf = (cfg) => {
+    const { at, ...q } = cfg;
+    return window.location.origin + window.location.pathname + '#qr=' + LZString.compressToEncodedURIComponent(JSON.stringify(packExamForQR(exam, '', q)));
+  };
+
+  // Серверт шалгалтын багц байхгүй бол үүсгэнэ (сурагч 1 уншилтаар ачаална)
+  useEffect(() => {
+    try {
+      const db = getDb(), teacher = ensureTeacherAuth();
+      if (db && teacher) {
+        const versions = {};
+        normalizeVariants(exam).forEach(v => {
+          const qs = (v.questions || []).filter(q => (q.text || '').trim());
+          if (qs.length) versions[v.label || 'A'] = packQuestions(qs);
+        });
+        if (Object.keys(versions).length) ensureClientPackIfMissing(db, exam, teacher.uid, versions);
+      }
+    } catch (_) {}
+    // Өмнө үүсгэсэн QR-уудыг серверээс нэгтгэнэ (өөр төхөөрөмжөөс үүсгэсэн ч харагдана)
+    try {
+      const db = getDb();
+      if (db) roomRef(db, exam.id).child('qrLinks').once('value').then(snap => {
+        const v = snap.val(); if (!v) return;
+        setLinks(prev => {
+          const m = new Map(prev.map(x => [x.i, x]));
+          Object.values(v).filter(Boolean).forEach(x => { if (x.i && !m.has(x.i)) m.set(x.i, x); });
+          return [...m.values()].sort((a, b) => (b.at || 0) - (a.at || 0));
+        });
+      }).catch(() => {});
+    } catch (_) {}
+  }, [exam.id]);
+
+  useEffect(() => {
+    if (!cur || !qrRef.current) return;
+    qrRef.current.innerHTML = '';
+    try {
+      new QRCode(qrRef.current, { text: urlOf(cur), width: 240, height: 240, colorDark: '#1e293b', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
+    } catch (e) { qrRef.current.innerHTML = '<div style="color:red">QR үүсгэхэд алдаа гарлаа</div>'; }
+  }, [cur]);
+
+  const generate = () => {
+    const cfg = {
+      i: uid().slice(0, 6), k: kind,
+      d: Math.max(0, Math.min(600, Math.round(+f.d || 0))),
+      p: Math.max(0, Math.min(100, Math.round(+f.p || 0))),
+      m: ['best', 'avg', 'last', 'min'].includes(f.m) ? f.m : 'best',
+      a: Math.max(0, Math.min(50, Math.round(+f.a || 0))),
+      ac: f.ac ? 1 : 0, at: Date.now()
+    };
+    const next = [cfg, ...links].slice(0, 30);
+    setLinks(next); setCur(cfg);
+    if (onSaveLinks) onSaveLinks(next);
+    try { const db = getDb(); if (db) roomRef(db, exam.id).child('qrLinks').child(cfg.i).set(cfg).catch(() => {}); } catch (_) {}
+  };
+  const removeLink = (l) => {
+    if (!confirm('Энэ QR-ийн бүртгэлийг жагсаалтаас хасах уу? (Өгсөн дүн устахгүй)')) return;
+    const next = links.filter(x => x.i !== l.i);
+    setLinks(next); if (onSaveLinks) onSaveLinks(next);
+    try { const db = getDb(); if (db) roomRef(db, exam.id).child('qrLinks').child(l.i).remove().catch(() => {}); } catch (_) {}
+  };
+  const copyLink = async () => {
+    try { await navigator.clipboard.writeText(urlOf(cur)); setCopied(true); setTimeout(() => setCopied(false), 1800); }
+    catch (_) { window.prompt('Холбоосыг хуулна уу:', urlOf(cur)); }
+  };
+  const pngName = () => 'QR_' + (exam.title || 'exam').replace(/[\\/:*?"<>|\s]+/g, '_') + '_' + (cur && cur.k === 'p' ? 'dasgal' : 'shalgalt') + '.png';
+  const downloadPng = () => {
+    try {
+      const c = qrRef.current.querySelector('canvas');
+      const a = document.createElement('a');
+      a.href = c ? c.toDataURL('image/png') : qrRef.current.querySelector('img').src;
+      a.download = pngName(); document.body.appendChild(a); a.click(); a.remove();
+    } catch (_) { alert('PNG татаж чадсангүй'); }
+  };
+  const printQr = () => {
+    try {
+      const c = qrRef.current.querySelector('canvas');
+      const src = c ? c.toDataURL('image/png') : qrRef.current.querySelector('img').src;
+      const w = window.open('', '_blank');
+      if (!w) { alert('Цонх нээгдсэнгүй (popup хаалттай байна)'); return; }
+      const esc = (t) => String(t || '').replace(/[<>&]/g, '');
+      w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>QR</title></head><body style="font-family:sans-serif;text-align:center;padding:30px"><h2>' + esc(exam.title) + '</h2><h3>' + (cur.k === 'p' ? '📝 Дасгал' : '🎓 Шалгалт') + '</h3><img src="' + src + '" style="width:340px;height:340px"/><p style="font-size:18px">QR уншуулаад анги, нэрээ бичнэ үү</p><script>setTimeout(function(){window.print()},300)<\/script></body></html>');
+      w.document.close();
+    } catch (_) { alert('Хэвлэж чадсангүй'); }
+  };
+
+  const seg = (on) => 'seg-b' + (on ? ' on' : '');
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:520,maxHeight:'92vh',overflowY:'auto'}}>
+        <div className="modal-head">
+          <div>
+            <div style={{fontFamily:'Outfit',fontWeight:800,fontSize:'1.1rem'}}>📱 QR · {exam.title}</div>
+            <div style={{fontSize:'0.8rem',color:'var(--text2)'}}>Сурагч QR уншуулахад <b>анги, нэр</b> 2-ыг заавал бичнэ</div>
+          </div>
+        </div>
+        {!cur ? (
+          <>
+            <div className="modal-body">
+              <div className="form-group">
+                <label className="form-label">Энэ QR юуны төлөө вэ?</label>
+                <div className="seg" style={{display:'flex'}}>
+                  <button className={seg(kind === 'e')} style={{flex:1}} onClick={() => pickKind('e')}>🎓 Шалгалтын QR</button>
+                  <button className={seg(kind === 'p')} style={{flex:1}} onClick={() => pickKind('p')}>📝 Дасгалын QR</button>
+                </div>
+                <div className="form-hint">{kind === 'e' ? 'Шалгалт: дүн «Шалгалт» хэсэгт орно, чит хамгаалалт, хугацаатай байж болно.' : 'Дасгал: дүн тусдаа «Дасгал» хэсэгт орно, хугацаагүй, хязгааргүй оролдлоготой байж болно.'}</div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+                <div className="form-group">
+                  <label className="form-label">⏱ Хугацаа (минут)</label>
+                  <input className="form-input" type="number" min="0" max="600" value={f.d} onChange={setField('d')} />
+                  <div className="form-hint">0 = цаггүй</div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">✅ Тэнцэх босго (%)</label>
+                  <input className="form-input" type="number" min="0" max="100" value={f.p} onChange={setField('p')} />
+                  <div className="form-hint">Энэ оноонос доош = тэнцээгүй</div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">🔁 Оролдлогын тоо</label>
+                  <select className="form-select" value={f.a} onChange={setField('a')}>
+                    <option value={0}>Хязгааргүй</option>
+                    {[1, 2, 3, 4, 5, 10].map(n => <option key={n} value={n}>{n} удаа</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">🧮 Дүнг хэрхэн тооцох</label>
+                  <select className="form-select" value={f.m} onChange={setField('m')}>
+                    {QR_MODE_OPTS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
+                </div>
+              </div>
+              <label style={{display:'flex',gap:8,alignItems:'center',fontSize:'0.88rem',marginTop:4}}>
+                <input type="checkbox" checked={!!f.ac} onChange={setField('ac')} /> Чит хамгаалалт асаах
+              </label>
+              {links.length > 0 && (
+                <div style={{marginTop:18}}>
+                  <div style={{fontWeight:800,fontSize:'0.85rem',marginBottom:8}}>Өмнө үүсгэсэн QR-ууд</div>
+                  {links.map(l => (
+                    <div key={l.i} style={{display:'flex',gap:8,alignItems:'center',justifyContent:'space-between',padding:'8px 10px',border:'1px solid var(--border)',borderRadius:10,marginBottom:6,fontSize:'0.78rem'}}>
+                      <div style={{minWidth:0}}>{qrCfgSummary(l)}<div style={{color:'var(--text3)'}}>{l.at ? fmtDate(new Date(l.at).toISOString()) : ''}</div></div>
+                      <div style={{display:'flex',gap:6,flexShrink:0}}>
+                        <button className="btn btn-outline btn-sm" onClick={() => setCur(l)}>QR</button>
+                        <button className="btn btn-outline btn-sm" onClick={() => removeLink(l)}>🗑</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="modal-foot" style={{flexWrap:'wrap',gap:8}}>
+              <button className="btn btn-ghost" onClick={onClose}>Хаах</button>
+              <button className="btn btn-outline" onClick={() => onOpenResults(kind === 'p' ? 'practice' : 'exam')}>📊 QR үр дүн / Excel</button>
+              <button className="btn btn-primary" onClick={generate}>✓ QR үүсгэх</button>
+            </div>
+            <div style={{padding:'0 20px 16px'}}>
+              <button className="btn btn-ghost btn-sm" style={{width:'100%',justifyContent:'center'}} onClick={onLegacy}>Ангид томилсон QR (хуучин хэлбэр)</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="modal-body" style={{textAlign:'center'}}>
+              <div style={{display:'inline-block',padding:'4px 12px',borderRadius:20,fontWeight:800,fontSize:'0.85rem',background: cur.k === 'p' ? '#dcfce7' : '#dbeafe',color: cur.k === 'p' ? '#166534' : '#1e40af',marginBottom:8}}>
+                {cur.k === 'p' ? '📝 Дасгалын QR' : '🎓 Шалгалтын QR'}
+              </div>
+              <div style={{fontSize:'0.78rem',color:'var(--text2)',marginBottom:12}}>{qrCfgSummary(cur)}</div>
+              <div ref={qrRef} style={{display:'flex',justifyContent:'center',margin:'0 auto 12px',minHeight:240}} />
+              <div style={{fontSize:'0.85rem',color:'var(--text2)',lineHeight:1.6}}>Сурагч уншуулаад <b>анги</b>, <b>нэр</b>-ээ бичээд {cur.k === 'p' ? 'дасгалаа' : 'шалгалтаа'} шууд эхэлнэ.</div>
+              <div style={{display:'flex',gap:8,flexWrap:'wrap',justifyContent:'center',marginTop:14}}>
+                <button className="btn btn-outline btn-sm" onClick={copyLink}>{copied ? '✓ Хуулсан' : '🔗 Холбоос хуулах'}</button>
+                <button className="btn btn-outline btn-sm" onClick={downloadPng}>⬇ PNG</button>
+                <button className="btn btn-outline btn-sm" onClick={printQr}>🖨 Хэвлэх</button>
+                <button className="btn btn-violet btn-sm" onClick={() => onOpenResults(cur.k === 'p' ? 'practice' : 'exam')}>📊 QR үр дүн / Excel</button>
+              </div>
+            </div>
+            <div className="modal-foot">
+              <button className="btn btn-ghost" onClick={() => setCur(null)}>← Тохиргоо</button>
+              <button className="btn btn-outline" onClick={onClose}>Хаах</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function QRModal({ exam, onClose }) {
   const [step, setStep] = useState('confirm'); // confirm | addClass | qr
   const [classInput, setClassInput] = useState('');
@@ -6013,6 +6467,12 @@ function QRModal({ exam, onClose }) {
                 onClick={() => goQrForClass(classInput)}
               >
                 {savingClass ? '⏳ ...' : '✓ Тийм, үүсгэх'}
+              </button>
+            </div>
+            <div style={{padding:'0 20px 16px'}}>
+              <button className="btn btn-outline" style={{width:'100%',justifyContent:'center'}} disabled={savingClass}
+                onClick={() => goQrForClass(ANY_CLASS)}>
+                👥 Анги томилохгүй: сурагч өөрөө анги, нэрээ бичнэ
               </button>
             </div>
           </>
@@ -6215,7 +6675,7 @@ function QRRoomLoader({ roomID, onLoaded, onBack }) {
 }
 
 // ─── CHEAT DETAIL MODAL ───────────────────────────────────────────────────────
-const SCORE_MODE_LABEL = { best: 'Хамгийн өндөр дүнгээр', avg: 'Дундажаар', last: 'Сүүлийн дүнгээр' };
+const SCORE_MODE_LABEL = { best: 'Хамгийн өндөр дүнгээр', avg: 'Дундажаар', last: 'Сүүлийн дүнгээр', min: 'Хамгийн бага дүнгээр' };
 const answeredCount = (s) => Object.keys(s.answers || {}).filter((k) => s.answers[k] != null && s.answers[k] !== '').length;
 const subStudentKey = (s) => s.uid || ((s.studentName || '') + '|' + (s.studentClass || ''));
 const isRetrySub = (s) => s.mode === 'mistakes' || (Array.isArray(s.subset) && s.subset.length > 0);
@@ -6244,6 +6704,7 @@ const groupByStudent = (subs, mode) => {
     let score, ref;
     if (mode === 'avg') { score = Math.round(base.reduce((t, x) => t + (x.score || 0), 0) / base.length); ref = base[base.length - 1]; }
     else if (mode === 'last') { ref = base[base.length - 1]; score = ref.score || 0; }
+    else if (mode === 'min') { ref = base.reduce((w, x) => ((x.score || 0) < (w.score || 0) ? x : w), base[0]); score = ref.score || 0; }
     else { ref = base.reduce((bst, x) => ((x.score || 0) > (bst.score || 0) ? x : bst), base[0]); score = ref.score || 0; }
     return { key, name: attempts[0].studentName, cls: attempts[0].studentClass || '', attempts, fullCount: full.length, score, ref };
   }).sort((x, y) => y.score - x.score);
@@ -6366,8 +6827,23 @@ function CheatDetailModal({ sub, onClose }) {
 }
 
 
-function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onCheatClose }) {
+function ExamResultsView({ exam, allSubs: allSubsAll, source, initialKind, onBack, onCheatClick, cheatSub, onCheatClose }) {
   const [detailSub, setDetailSub] = useState(null);
+  // QR-аар орсон «Шалгалт» / «Дасгал»-ыг ялгана (таг байхгүй бол шалгалт гэж үзнэ)
+  // source='qr' → зөвхөн QR-аар орсон (шалгалт/дасгал таг-тай) дүн; бусад үед QR-гүй (бүртгэлтэй/ангийн) дүн
+  const isQr = source === 'qr';
+  const allSubsRaw = useMemo(() => (allSubsAll || []).filter(x => isQr ? !!x.qrKind : !x.qrKind), [allSubsAll, isQr]);
+  const [kindTab, setKindTab] = useState(isQr ? (initialKind || 'all') : 'all');
+  const [modeView, setModeView] = useState(exam.scoreMode || 'best');
+  const subKind = (x) => (x.qrKind === 'practice' ? 'practice' : 'exam');
+  const kindCount = useMemo(() => ({
+    all: allSubsRaw.length,
+    exam: allSubsRaw.filter(x => subKind(x) === 'exam').length,
+    practice: allSubsRaw.filter(x => subKind(x) === 'practice').length
+  }), [allSubsRaw]);
+  const allSubs = useMemo(() => kindTab === 'all' ? allSubsRaw : allSubsRaw.filter(x => subKind(x) === kindTab), [allSubsRaw, kindTab]);
+  // QR тус бүрийн тэнцэх босго (багш QR үүсгэхдээ өөрөөр тогтоосон байж болно)
+  const passOf = (x) => { const l = (exam.qrLinks || []).find(q => q && q.i && q.i === (x && x.qrLink)); return (l && l.p != null) ? +l.p : (exam.passingScore ?? 60); };
   const classOptions = useMemo(
     () => [...new Set(allSubs.map(s => (s.studentClass || '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'mn')),
     [allSubs]
@@ -6377,10 +6853,7 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
   const [verifiedSubs, setVerifiedSubs] = useState(null);
 
   useEffect(() => {
-    if (classOptions.length === 0) setClassFilter('all');
-    else if (classFilter === 'all' || !classOptions.includes(classFilter)) {
-      setClassFilter(classOptions[0]);
-    }
+    if (classFilter !== 'all' && !classOptions.includes(classFilter)) setClassFilter('all');
   }, [classOptions.join('|')]);
 
   const subs = useMemo(() => {
@@ -6428,9 +6901,9 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
 
   const displaySubs = verifiedSubs || subs;
 
-  const groups = useMemo(() => groupByStudent(displaySubs, exam.scoreMode || 'best'), [displaySubs, exam.scoreMode]);
+  const groups = useMemo(() => groupByStudent(displaySubs, modeView), [displaySubs, modeView]);
   const avg = groups.length ? Math.round(groups.reduce((a, g) => a + g.score, 0) / groups.length) : 0;
-  const passed = groups.filter(g => g.score >= exam.passingScore).length;
+  const passed = groups.filter(g => g.score >= passOf(g.ref)).length;
 
   const variantGroups = {};
   displaySubs.forEach(s => {
@@ -6441,6 +6914,11 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
   const variantLabels = Object.keys(variantGroups).sort();
 
   const safeTitle = (exam.title || 'results').replace(/[\\/:*?"<>|]+/g, ' ').trim();
+  // «Бүх анги» үед анги бүрийг тусад нь хэсэглэж харуулна
+  const sections = (classFilter === 'all' && classOptions.length > 1)
+    ? [...classOptions, ''].map(cls => ({ cls, gs: groups.filter(g => (g.cls || '').trim() === cls) })).filter(x => x.gs.length)
+    : [{ cls: null, gs: groups }];
+  const secStat = (gs) => ({ avg: gs.length ? Math.round(gs.reduce((t, g) => t + g.score, 0) / gs.length) : 0, ok: gs.filter(g => g.score >= passOf(g.ref)).length });
 
   return (
     <div>
@@ -6448,7 +6926,7 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
         <div style={{display:'flex',alignItems:'center',gap:14,flexWrap:'wrap'}}>
           <button className="btn btn-ghost btn-sm" onClick={onBack}>← Буцах</button>
           <div>
-            <h2 className="page-title">{exam.title} — Үр дүн</h2>
+            <h2 className="page-title">{isQr ? '📱 QR · ' : ''}{exam.title} — Үр дүн</h2>
             <div className="page-sub">
               {exam.subject} · {classFilter === 'all' ? allSubs.length : subs.length} сурагч
               {classFilter !== 'all' && <span> · <strong>{classFilter}</strong> анги</span>}
@@ -6491,7 +6969,7 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
             )}
             <button
               className="btn btn-outline btn-sm"
-              onClick={() => downloadExcelByClass(`SmartEXAM_${safeTitle}`, allSubs, exam.scoreMode)}
+              onClick={() => downloadExcelByClass(`SmartEXAM_${isQr ? 'QR_' : ''}${safeTitle}${kindTab === 'practice' ? '_dasgal' : kindTab === 'exam' ? '_shalgalt' : ''}`, classFilter === 'all' ? allSubs : allSubs.filter(x => (x.studentClass || '').trim() === classFilter), modeView, passOf)}
             >
               ⬇ Excel татах
             </button>
@@ -6499,6 +6977,31 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
         </div>
       </div>
       <div className="container">
+        <div className="card" style={{marginBottom:14}}>
+          <div className="card-body" style={{padding:'12px 16px',display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
+            {isQr && <div className="seg">
+              {[['all', 'Бүгд'], ['exam', '🎓 Шалгалт'], ['practice', '📝 Дасгал']].map(([k, l]) => (
+                <button key={k} className={'seg-b' + (kindTab === k ? ' on' : '')} onClick={() => setKindTab(k)}>{l} ({kindCount[k]})</button>
+              ))}
+            </div>}
+            <select className="form-select" style={{width:'auto',minWidth:190}} value={modeView} onChange={e => setModeView(e.target.value)}>
+              <option value="best">Дүн: хамгийн өндрөөр</option>
+              <option value="avg">Дүн: дундажаар</option>
+              <option value="last">Дүн: сүүлийнхээр</option>
+              <option value="min">Дүн: хамгийн багаар</option>
+            </select>
+            {classOptions.length > 0 && (
+              <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                <button className={'btn btn-sm ' + (classFilter === 'all' ? 'btn-violet' : 'btn-outline')} onClick={() => setClassFilter('all')}>Бүх анги</button>
+                {classOptions.map(cls => (
+                  <button key={cls} className={'btn btn-sm ' + (classFilter === cls ? 'btn-violet' : 'btn-outline')} onClick={() => setClassFilter(cls)}>
+                    {cls} ({allSubs.filter(x => (x.studentClass || '').trim() === cls).length})
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
         <div className="stats-strip">
           <div className="stat-card"><div className="stat-val">{displaySubs.length}</div><div className="stat-lbl">Нийт оролцсон</div></div>
           <div className="stat-card"><div className="stat-val" style={{color:'var(--green)'}}>{passed}</div><div className="stat-lbl">Тэнцсэн</div></div>
@@ -6549,11 +7052,17 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
               <table className="sub-table">
                 <thead>
                   <tr>
-                    <th>#</th><th>Нэр</th><th className="col-hide-m">Анги</th><th className="col-hide-m">Хувилбар</th><th>Дүн</th><th className="col-hide-m">Хугацаа</th><th className="col-hide-m">Cheat</th><th className="col-hide-m">Огноо</th>
+                    <th>#</th><th>Нэр</th><th>Анги</th><th className="col-hide-m">Хувилбар</th><th>Дүн</th><th className="col-hide-m">Хугацаа</th><th className="col-hide-m">Cheat</th><th className="col-hide-m">Огноо</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {groups.map((g, i) => {
+                  {sections.map(sec => (<React.Fragment key={sec.cls === null ? 'all' : ('c_' + sec.cls)}>
+                  {sec.cls !== null && (() => { const st = secStat(sec.gs); return (
+                    <tr><td colSpan={8} style={{background:'var(--violet-light)',fontWeight:800,color:'#4c3db0',padding:'10px 14px'}}>
+                      📚 {sec.cls || 'Ангигүй'} анги · {sec.gs.length} сурагч · дундаж {st.avg}% · тэнцсэн {st.ok} / тэнцээгүй {sec.gs.length - st.ok}
+                    </td></tr>
+                  ); })()}
+                  {sec.gs.map((g, i) => {
                     const s = g.ref;
                     const cheatCnt = g.attempts.reduce((t, a) => t + (a.cheatLog || []).length, 0);
                     const pillCls = cheatCnt === 0 ? 'cheat-pill-0' : cheatCnt <= 2 ? 'cheat-pill-warn' : 'cheat-pill-danger';
@@ -6563,15 +7072,15 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
                       <tr key={g.key} className={'sub-row-click' + (cheatCnt > 0 ? ' cheat-row-bad' : '')} onClick={() => setDetailSub({ g, rank: i+1 })}>
                         <td style={{color:'var(--text3)',fontWeight:600}}>{i+1}</td>
                         <td><strong>{g.name}</strong></td>
-                        <td className="col-hide-m">{g.cls || '—'}</td>
+                        <td>{g.cls || '—'}</td>
                         <td className="col-hide-m"><span className="badge badge-violet" style={{fontFamily:'monospace',fontWeight:800,fontSize:'0.85rem'}}>{vlabel}</span></td>
                         <td>
-                          <span style={{fontFamily:'Outfit',fontWeight:700,fontSize:'1rem',color: g.score >= exam.passingScore ? 'var(--green)' : 'var(--red)'}}>{g.score}%</span>
+                          <span style={{fontFamily:'Outfit',fontWeight:700,fontSize:'1rem',color: g.score >= passOf(g.ref) ? 'var(--green)' : 'var(--red)'}}>{g.score}%</span>
                           <div style={{color:'var(--text3)',fontSize:'0.75rem',marginTop:2}}>
                             {g.attempts.length} оролдлого
                             {' · '}
-                            <span style={{fontWeight:700,color: g.score >= exam.passingScore ? 'var(--green)' : 'var(--red)'}}>
-                              {g.score >= exam.passingScore ? 'Тэнцсэн' : 'Тэнцээгүй'}
+                            <span style={{fontWeight:700,color: g.score >= passOf(g.ref) ? 'var(--green)' : 'var(--red)'}}>
+                              {g.score >= passOf(g.ref) ? 'Тэнцсэн' : 'Тэнцээгүй'}
                             </span>
                           </div>
                         </td>
@@ -6585,6 +7094,7 @@ function ExamResultsView({ exam, allSubs, onBack, onCheatClick, cheatSub, onChea
                       </tr>
                     );
                   })}
+                  </React.Fragment>))}
                 </tbody>
               </table>
             </div>
@@ -6885,7 +7395,7 @@ function ZipGradeExam({ exam, onBack, onSaveSubmission, initialTab }) {
     } else if (t === 'mcq' || t === 'tf') {
       const os = q.options || [], long = os.some(o => String(o.text || '').length > 28);
       out.push('<div class="opts ' + (long ? 'c1' : 'c2') + '">' + os.map((o, i) => '<div><b>' + zgEsc(o.key || alpha(i)) + '.</b>' + window.seMathHTML(o.text) + '</div>').join('') + '</div>');
-    } else if (t === 'open') {
+    } else if (t === 'open' || t === 'rewrite') {
       out.push('<div class="lines"><i></i><i></i><i></i><i></i></div>');
     } else {
       out.push('<div class="ans">Хариу: ______________________' + (q.unit ? ' ' + zgEsc(q.unit) : '') + '</div>');
@@ -7202,9 +7712,10 @@ function ZipGradeExam({ exam, onBack, onSaveSubmission, initialTab }) {
 }
 
 
-function TeacherDashboard({ exams, submissions: localSubs, teacherName, onCreateExam, onEditExam, onDeleteExam, onLogout, onSaveSubmission }) {
+function TeacherDashboard({ exams, submissions: localSubs, teacherName, onCreateExam, onEditExam, onUpdateExam, onDeleteExam, onLogout, onSaveSubmission }) {
   const [view, setView] = useState(null);
   const [qrExam, setQrExam] = useState(null);
+  const [qrHub, setQrHub] = useState(null);
   const [cheatSub, setCheatSub] = useState(null);
   const [delExam, setDelExam] = useState(null);
   const [stopExam, setStopExam] = useState(null);
@@ -7301,7 +7812,9 @@ function TeacherDashboard({ exams, submissions: localSubs, teacherName, onCreate
     const allSubs = Array.isArray(rtdbSubs) && rtdbSubs.length ? rtdbSubs : submissions.filter(s => s.examId === view.exam.id);
     return (
       <ExamResultsView
-        exam={view.exam}
+        exam={exams.find(e => e.id === view.exam.id) || view.exam}
+        initialKind={view.kind}
+        source={view.source}
         allSubs={allSubs}
         onBack={() => setView(null)}
         onCheatClick={setCheatSub}
@@ -7313,6 +7826,15 @@ function TeacherDashboard({ exams, submissions: localSubs, teacherName, onCreate
 
   return (
     <div>
+      {qrHub && (
+        <QRHubModal
+          exam={qrHub}
+          onClose={() => setQrHub(null)}
+          onSaveLinks={(links) => { if (onUpdateExam) onUpdateExam({ ...(exams.find(e => e.id === qrHub.id) || qrHub), qrLinks: links }); }}
+          onOpenResults={(kind) => { const ex = exams.find(e => e.id === qrHub.id) || qrHub; setQrHub(null); setView({ type: 'results', exam: ex, kind, source: 'qr' }); }}
+          onLegacy={() => { const ex = qrHub; setQrHub(null); setQrExam(ex); }}
+        />
+      )}
       {qrExam && <QRModal exam={qrExam} onClose={() => setQrExam(null)} />}
       {cheatSub && <CheatDetailModal sub={cheatSub} onClose={() => setCheatSub(null)} />}
       {delExam && (
@@ -7404,6 +7926,8 @@ function TeacherDashboard({ exams, submissions: localSubs, teacherName, onCreate
                     <button className="btn btn-primary btn-sm" onClick={(e) => { e.stopPropagation(); onEditExam ? onEditExam(exam) : null; }}>✏️ Засах</button>
                     <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); setView({type:'results', exam}); }}>📊 Үр дүн</button>
                     <MoreMenu items={[
+                      { label: '📱 QR (шалгалт / дасгал)', onClick: () => setQrHub(exam) },
+                      { label: '📊 QR үр дүн', onClick: () => setView({type:'results', exam, source:'qr'}) },
                       { label: '⬛ ZipGrade', onClick: () => setView({type:'zipgrade', exam}) },
                       { label: '🖨 Хэвлэх', onClick: () => setView({type:'zipgrade', exam, tab:'print'}) },
                       { label: '⏹ Зогсоох', onClick: () => setStopExam(exam) },
@@ -7433,8 +7957,8 @@ function ExamIntro({ exam, studentName, studentClass, onStart, onBack }) {
         const db = getDb();
         if (db) {
           const st = (await roomRef(db, exam.id).child('settings').once('value')).val() || {};
-          if (st.maxAttempts > 0) cap = st.maxAttempts;
-          if (st.scoreMode) mode = st.scoreMode;
+          if (!exam.qrCfg && st.maxAttempts > 0) cap = st.maxAttempts;
+          if (!exam.qrCfg && st.scoreMode) mode = st.scoreMode;
           const u = getAuth()?.currentUser;
           if (u && !u.isAnonymous) {
             const a = (await db.ref('attempts/' + u.uid + '/' + exam.id).once('value')).val() || {};
@@ -7445,7 +7969,7 @@ function ExamIntro({ exam, studentName, studentClass, onStart, onBack }) {
       if (!used) {
         try {
           const loc = JSON.parse(localStorage.getItem('se_submissions') || '[]');
-          used = loc.filter(x => x.examId === exam.id && x.studentName === studentName && !x.subset && x.mode !== 'mistakes').length;
+          used = loc.filter(x => x.examId === exam.id && x.studentName === studentName && (!exam.qrLink || x.qrLink === exam.qrLink) && !x.subset && x.mode !== 'mistakes').length;
         } catch (_) {}
       }
       if (ok) setAtt({ cap, used, mode });
@@ -7453,7 +7977,7 @@ function ExamIntro({ exam, studentName, studentClass, onStart, onBack }) {
     return () => { ok = false; };
   }, [exam.id]);
   const capI = att?.cap || 0, usedI = att?.used || 0, modeI = att?.mode || exam.scoreMode || 'best';
-  const modeTxt = modeI === 'avg' ? 'Бүх оролдлогын ДУНДАЖ оноо дүнд тооцогдоно.' : modeI === 'last' ? 'Хамгийн СҮҮЛИЙН оролдлогын оноо дүнд тооцогдоно.' : 'Хамгийн ӨНДӨР оноо дүнд тооцогдоно.';
+  const modeTxt = modeI === 'avg' ? 'Бүх оролдлогын ДУНДАЖ оноо дүнд тооцогдоно.' : modeI === 'last' ? 'Хамгийн СҮҮЛИЙН оролдлогын оноо дүнд тооцогдоно.' : modeI === 'min' ? 'Хамгийн БАГА оноо дүнд тооцогдоно.' : 'Хамгийн ӨНДӨР оноо дүнд тооцогдоно.';
   const leftI = Math.max(0, capI - usedI);
   return (
     <div className="modal-overlay">
@@ -7463,7 +7987,7 @@ function ExamIntro({ exam, studentName, studentClass, onStart, onBack }) {
             <div style={{width:44,height:44,borderRadius:12,background:'var(--violet-light)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.5rem'}}>📝</div>
             <div>
               <div style={{fontFamily:'Outfit',fontWeight:800,fontSize:'1.1rem'}}>{exam.title}</div>
-              <div style={{fontSize:'0.8rem',color:'var(--text2)'}}>{exam.subject}</div>
+              <div style={{fontSize:'0.8rem',color:'var(--text2)'}}>{exam.subject}{exam.qrKind === 'practice' ? ' · 📝 Дасгал' : exam.qrKind === 'exam' ? ' · 🎓 Шалгалт' : ''}</div>
             </div>
           </div>
         </div>
@@ -7508,7 +8032,7 @@ function ExamIntro({ exam, studentName, studentClass, onStart, onBack }) {
 }
 
 // ─── EXAM TAKER ───────────────────────────────────────────────────────────────
-function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack }) {
+function ExamTaker({ exam, studentName, studentClass, onSubmit, onBack }) {
   const timed = examDurationOf(exam) > 0;
   const antiOn = exam.antiCheat !== false;
   const [answers, setAnswers] = useState({});
@@ -7524,6 +8048,7 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
   const startMsRef = useRef(Date.now());
 
   const orderedQuestions = useMemo(() => exam.questions || [], [exam]);
+  const docMode = isDocExam(orderedQuestions);
 
   const cheatArmedRef = useRef(false);
   const cheatGraceUntilRef = useRef(Date.now() + 5000);
@@ -7768,7 +8293,9 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
         verified: false,
         gradedBy: 'pending',
         subset: exam._subset || null,
-        mode: exam._subset ? 'mistakes' : 'full'
+        mode: exam._subset ? 'mistakes' : 'full',
+        qrKind: exam.qrKind || null,
+        qrLink: exam.qrLink || null
       };
 
       try {
@@ -7785,8 +8312,7 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
             variantLabel: submission.variantLabel,
             subset: exam._subset || null,
             cheatLog: submission.cheatLog,
-            timeSpentSec,
-            attempt: account ? { classId: account.classId, kind: account.kind, extra: !!exam._extra, title: exam.title || '' } : null
+            timeSpentSec
           });
           submission = {
             ...submission,
@@ -7795,13 +8321,19 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
             correctCount: graded.correctCount,
             totalCount: graded.totalCount,
             verified: true,
-            gradedBy: 'cloud',
+            gradedBy: 'client',
             wrongIds: Array.isArray(graded.wrongIds) ? graded.wrongIds : null
           };
           if (exam._subset) {
             try {
               const dbm = getDb();
               if (dbm) roomRef(dbm, exam.id).child('submissions').child(submission.id).update({ subset: exam._subset, mode: 'mistakes' }).catch(() => {});
+            } catch (_) {}
+          }
+          if (exam.qrKind) {
+            try {
+              const dbq = getDb();
+              if (dbq) roomRef(dbq, exam.id).child('submissions').child(submission.id).update({ qrKind: exam.qrKind, qrLink: exam.qrLink || '' }).catch(() => {});
             } catch (_) {}
           }
           if (exam._subset && submission.wrongIds) {
@@ -7835,13 +8367,77 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
     })();
   }, [answers, exam, studentName, studentClass, onSubmit]);
 
+  // ─── ХАТУУ ЧИТ ХАМГААЛАЛТ: шалгалтын цонхноос гарвал агуулга нуугдаж, 3 удаа гарвал автоматаар дуусна ───
+  const MAX_STRIKES = 3;
+  const [away, setAway] = useState(false);
+  const strikes = cheatLog.filter(e => ['TAB_SWITCH', 'WINDOW_BLUR', 'SPLIT_SCREEN', 'TRANSLATE', 'FULLSCREEN_EXIT', 'SIDE_PANEL'].includes(e.type)).length;
+  useEffect(() => {
+    if (!antiOn || cheatExempt) return;
+    const root = document.documentElement;
+    const goFull = () => { try { if (document.fullscreenEnabled && !document.fullscreenElement) root.requestFullscreen({ navigationUI: 'hide' }).catch(() => {}); } catch {} };
+    goFull();
+    // Хажуугийн самбар (Gemini, AI, орчуулагч) нээгдэхэд цонхны өргөн багасдаг: тэр даруй агуулгыг нууж, зөрчилд тооцно (компьютер дээр)
+    const isMob = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    let baseW = window.innerWidth, sideLogged = false;
+    const baseTimer = setTimeout(() => { baseW = window.innerWidth; }, 1500);
+    const onResize = () => {
+      if (isMob) return;
+      if (window.innerWidth < baseW * 0.9) {
+        setAway(true);
+        if (!sideLogged) { sideLogged = true; logCheat('SIDE_PANEL', '🪟 Хажуугийн самбар нээсэн (Gemini/AI/орчуулагч)'); }
+      } else { sideLogged = false; if (!document.hidden) setAway(false); }
+    };
+    window.addEventListener('resize', onResize);
+    const onFsChange = () => { if (!document.fullscreenElement && !submittedRef.current && document.fullscreenEnabled) logCheat('FULLSCREEN_EXIT', '⛶ Бүтэн дэлгэцээс гарсан'); };
+    const onTap = () => goFull();
+    const hide = () => setAway(true);
+    const show = () => { if (!document.hidden) setAway(false); };
+    const onVisAC = () => { if (document.hidden) setAway(true); else setAway(false); };
+    const stop = (e) => { e.preventDefault(); };
+    const inField = (e) => { const n = e.target && e.target.tagName; return n === 'INPUT' || n === 'TEXTAREA'; };
+    const onKey = (e) => {
+      const k = String(e.key || '').toLowerCase(), c = e.ctrlKey || e.metaKey;
+      if (k === 'f12' || (c && e.shiftKey && ['i', 'j', 'c'].includes(k)) || (c && ['p', 's', 'u'].includes(k)) || (c && ['c', 'x', 'v'].includes(k) && !inField(e))) { e.preventDefault(); logCheat('KEY_BLOCK', '⌨ Хориотой товчлол: ' + (c ? 'Ctrl+' : '') + k.toUpperCase()); }
+      if (k === 'printscreen') { try { navigator.clipboard && navigator.clipboard.writeText(''); } catch {} logCheat('PRINT_SCREEN', '📸 Дэлгэцийн зураг авахыг оролдсон'); }
+    };
+    const onBeforeUnload = (e) => { if (submittedRef.current) return; e.preventDefault(); e.returnValue = ''; };
+    const onSel = (e) => { if (!inField(e)) e.preventDefault(); };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('pointerdown', onTap);
+    window.addEventListener('blur', hide); window.addEventListener('focus', show);
+    document.addEventListener('visibilitychange', onVisAC);
+    document.addEventListener('paste', stop); document.addEventListener('cut', stop); document.addEventListener('copy', stop);
+    document.addEventListener('dragstart', stop); document.addEventListener('selectstart', onSel);
+    document.addEventListener('keydown', onKey); window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      clearTimeout(baseTimer); window.removeEventListener('resize', onResize);
+      document.removeEventListener('fullscreenchange', onFsChange); document.removeEventListener('pointerdown', onTap);
+      window.removeEventListener('blur', hide); window.removeEventListener('focus', show);
+      document.removeEventListener('visibilitychange', onVisAC);
+      document.removeEventListener('paste', stop); document.removeEventListener('cut', stop); document.removeEventListener('copy', stop);
+      document.removeEventListener('dragstart', stop); document.removeEventListener('selectstart', onSel);
+      document.removeEventListener('keydown', onKey); window.removeEventListener('beforeunload', onBeforeUnload);
+      try { if (document.fullscreenElement) document.exitFullscreen(); } catch {}
+    };
+  }, [antiOn, cheatExempt, logCheat]);
+  useEffect(() => {
+    if (antiOn && !cheatExempt && strikes >= MAX_STRIKES && !submittedRef.current) doSubmit({});
+  }, [strikes, antiOn, cheatExempt, doSubmit]);
+
   const answered = Object.keys(answers).length;
   const total = orderedQuestions.length;
   const timerClass = timeLeft < 60 ? 'danger' : timeLeft < 300 ? 'warn' : '';
   const cheatCnt = cheatLog.length;
 
   return (
-    <div className="exam-taking-root">
+    <div className={"exam-taking-root" + (antiOn && !cheatExempt ? " ac-on" : "")}>
+      {away && antiOn && !cheatExempt && !submitted && (
+        <div style={{position:'fixed',inset:0,zIndex:99999,background:'#111827',color:'#fff',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',textAlign:'center',padding:24}}>
+          <div style={{fontSize:'2.4rem'}}>⛔</div>
+          <div style={{fontWeight:700,fontSize:'1.15rem',margin:'10px 0'}}>Шалгалтын цонхноос гарлаа</div>
+          <div style={{opacity:.85,maxWidth:340}}>Шалгалт дуустал энэ цонхон дээр л байна уу. Өөр таб, апп, AI ашиглахыг хориглоно. Үлдсэн анхааруулга: {Math.max(0, MAX_STRIKES - strikes)}. Тэгтэл шалгалт автоматаар дуусна.</div>
+        </div>
+      )}
       {/* Cheat flash overlay */}
       {showFlash && antiOn && !cheatExempt && <div className="cheat-overlay" />}
 
@@ -7909,7 +8505,7 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
       </div>
 
       <div className="container-sm" style={{padding:'24px 20px'}}>
-        {orderedQuestions.map((q, qi) => {
+        {docMode ? <DocPaper questions={away ? [] : orderedQuestions} answers={answers} setAnswers={setAnswers} /> : (away ? [] : orderedQuestions).map((q, qi) => {
           const type = q.type || 'mcq';
           return (
           <div className={'question-block' + (answers[q.id] != null && answers[q.id] !== '' ? ' answered' : '')} key={q.id}>
@@ -7918,9 +8514,10 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
               {type === 'tf' && <span className="badge badge-amber">Зөв/Буруу</span>}
               {type === 'grid' && <span className="badge badge-blue">Grid-in</span>}
               {type === 'blank' && <span className="badge badge-blue">Нөхөх</span>}
+              {type === 'rewrite' && <span className="badge badge-amber">Өгүүлбэр засах</span>}
               {type === 'open' && <span className="badge badge-amber">Задгай</span>}
               {type === 'match' && <span className="badge badge-amber">Холбох</span>}
-              {q.topic && <span className="badge badge-gray">{q.topic}</span>}
+              {q.topic && <span className="badge badge-gray">{String(q.topic).replace(/^\u00a7/, '')}</span>}
               {answers[q.id] != null && answers[q.id] !== '' && <span style={{fontSize:'0.75rem',color:'var(--green)',fontWeight:600}}>✓ Хариуллаа</span>}
             </div>
             {q.sourceText && (
@@ -7952,6 +8549,13 @@ function ExamTaker({ exam, studentName, studentClass, account, onSubmit, onBack 
               <textarea className="form-textarea" style={{minHeight:140}} placeholder="Бодолт, хариултаа энд бичнэ үү..."
                 value={answers[q.id] || ''} spellCheck={false}
                 onChange={e => { const v = e.target.value; setAnswers(a => ({...a, [q.id]: v})); }} />
+            ) : type === 'rewrite' ? (
+              <div>
+                <div className="form-hint" style={{marginBottom:6}}>Өгүүлбэрийг зөв болгож, бүтнээр нь бичнэ үү (том жижиг үсэг, цэг таслал чухал).</div>
+                <textarea className="form-textarea" style={{minHeight:84,fontSize:'1.05rem'}}
+                  value={answers[q.id] != null ? answers[q.id] : (q.text || '')} spellCheck={false} autoCapitalize="off"
+                  onChange={e => { const v = e.target.value; setAnswers(a => ({...a, [q.id]: v})); }} />
+              </div>
             ) : type === 'blank' ? (
               <input className="form-input" placeholder="Хариултаа энд бичнэ үү..."
                 value={answers[q.id] || ''} autoComplete="off" autoCapitalize="off" spellCheck={false}
@@ -8093,7 +8697,7 @@ function ResultPage({ submission, exam, onHome }) {
                       <MatchReview q={q} ua={ua} />
                     ) : type === 'open' ? (
                       <div>Таны хариу: <div style={{whiteSpace:'pre-wrap',fontWeight:600}}>{String(ua || '—')}</div><div style={{color:'var(--text3)',fontSize:'0.75rem',marginTop:4}}>Багш гараар дүгнэнэ</div></div>
-                    ) : type === 'blank' ? (
+                    ) : (type === 'blank' || type === 'rewrite') ? (
                       <div>Таны хариу: <strong>{String(ua || '—')}</strong>{q.answer ? <span style={{color:'var(--green)'}}> · зөв: {String(q.answer).split('|')[0].trim()}</span> : null}</div>
                     ) : type === 'grid' ? (
                       <div>Таны хариу: <strong>{String(ua || '—').replace(/_/g, '')}</strong></div>
@@ -8135,7 +8739,10 @@ function QRStudentLogin({ exam, qrClassName, onStart, onBack }) {
   const [name, setName] = useState(() => {
     try { return JSON.parse(localStorage.getItem('se_student_profile_v1') || '{}').name || ''; } catch { return ''; }
   });
-  const classLabel = (qrClassName || exam?.qrClassName || '').trim();
+  const rawCls = (qrClassName || exam?.qrClassName || '').trim();
+  const askClass = !rawCls || rawCls.toLowerCase() === ANY_CLASS.toLowerCase();
+  const [typedCls, setTypedCls] = useState(() => { try { return JSON.parse(localStorage.getItem('se_student_profile_v1') || '{}').cls || ''; } catch { return ''; } });
+  const classLabel = askClass ? typedCls.trim() : rawCls;
   // Count questions: support both old (exam.questions) and new (exam.versions) format
   const qCount = useMemo(() => {
     if (exam?.versions && typeof exam.versions === 'object') {
@@ -8175,39 +8782,45 @@ function QRStudentLogin({ exam, qrClassName, onStart, onBack }) {
           <div style={{display:'flex',alignItems:'center',gap:12}}>
             <div style={{width:48,height:48,borderRadius:12,background:'linear-gradient(135deg,var(--primary),var(--violet))',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.4rem'}}>📱</div>
             <div>
-              <div style={{fontFamily:'Outfit',fontWeight:800,fontSize:'1.1rem'}}>QR Шалгалт</div>
+              <div style={{fontFamily:'Outfit',fontWeight:800,fontSize:'1.1rem'}}>{exam?.qrCfg?.k === 'p' ? 'QR Дасгал' : 'QR Шалгалт'}</div>
               <div style={{fontSize:'0.8rem',color:'var(--text2)'}}>{exam.title}{classLabel ? ' · ' + classLabel + ' анги' : ''}</div>
             </div>
           </div>
         </div>
         <div className="modal-body">
           <div style={{background:'var(--violet-light)',borderRadius:10,padding:'12px 16px',marginBottom:18,fontSize:'0.85rem',color:'#4c3db0',lineHeight:1.6}}>
-            📋 <strong>{qCount} асуулт</strong> &nbsp;·&nbsp; ⏱ <strong>{durationLabel(exam.duration)}</strong> &nbsp;·&nbsp; 📚 {exam.subject}
+            📋 <strong>{qCount} асуулт</strong> &nbsp;·&nbsp; ⏱ <strong>{durationLabel(exam?.qrCfg && exam.qrCfg.d != null ? exam.qrCfg.d : exam.duration)}</strong> &nbsp;·&nbsp; 📚 {exam.subject}
           </div>
           {exam.stopped && (
             <div style={{background:'var(--red-light)',border:'1px solid #fecaca',borderRadius:10,padding:'10px 14px',marginBottom:14,fontSize:'0.85rem',color:'var(--red)',fontWeight:700}}>
               ⏹ Энэ шалгалтыг багш зогсоосон байна.
             </div>
           )}
-          {!classLabel && (
+          {false && (
             <div style={{background:'var(--amber-light)',border:'1px solid #fcd34d',borderRadius:10,padding:'10px 14px',marginBottom:14,fontSize:'0.85rem',color:'#92400e',fontWeight:600}}>
               ⚠️ Хуучин QR байна. Багшаас шинэ QR (анги томилсон) аваарай.
             </div>
           )}
-          {classLabel && (
+          {!askClass && classLabel && (
             <div style={{background:'#ecfdf5',border:'1px solid #a7f3d0',borderRadius:10,padding:'10px 14px',marginBottom:14,fontSize:'0.88rem',color:'#065f46',fontWeight:600}}>
               📚 {classLabel} ангийн шалгалт — зөвхөн нэрээ бичнэ үү
             </div>
           )}
+          {askClass && (
+            <div className="form-group">
+              <label className="form-label">Таны анги (заавал)</label>
+              <input className="form-input" placeholder="жн: 11а" value={typedCls} onChange={e => setTypedCls(e.target.value)} autoFocus />
+            </div>
+          )}
           <div className="form-group">
-            <label className="form-label">Таны нэр</label>
+            <label className="form-label">Таны нэр (заавал)</label>
             <input
               className="form-input"
               placeholder="Бүтэн нэр"
               value={name}
               onChange={e => setName(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && name.trim() && classLabel && onStart(name.trim(), classLabel)}
-              autoFocus
+              autoFocus={!askClass}
             />
           </div>
         </div>
@@ -8218,7 +8831,7 @@ function QRStudentLogin({ exam, qrClassName, onStart, onBack }) {
             onClick={() => { const n=name.trim(); try { localStorage.setItem('se_student_profile_v1', JSON.stringify({ name: n, cls: classLabel })); } catch {} announceJoin(n); onStart(n, classLabel); }}
             disabled={!name.trim() || !classLabel || !!exam.stopped}
           >
-            ▶ Шалгалт эхлэх
+            {exam?.qrCfg?.k === 'p' ? '▶ Дасгал эхлэх' : '▶ Шалгалт эхлэх'}
           </button>
         </div>
       </div>
@@ -8238,13 +8851,14 @@ const prepareAttempt = (exam, onlyIds, extra) => {
   all.forEach(q => { if (q.sourceText) curSrc = q.sourceText; srcOf[q.id] = curSrc; });
   const hasPassage = all.some(q => q.sourceText);
   let picked = all.filter(q => !onlyIds || onlyIds.includes(q.id));
-  if (!hasPassage) picked = shuffleArr(picked);
+  const docX = isDocExam(all); // баримт хэлбэрийн шалгалтыг холихгүй: зураг дээрх дарааллаар нь өгнө
+  if (!hasPassage && !docX) picked = shuffleArr(picked);
   let prevSrc = '';
   const qs = picked.map(q0 => {
     const s = srcOf[q0.id] || '';
     const q = hasPassage ? { ...q0, sourceText: (s && s !== prevSrc) ? s : '' } : q0;
     if (hasPassage && s) prevSrc = s;
-    if ((q.type || 'mcq') !== 'mcq' || !(q.options || []).length) return q;
+    if (docX || (q.type || 'mcq') !== 'mcq' || !(q.options || []).length) return q;
     const map = {};
     const options = shuffleArr(q.options).map((o, i) => { const k = alpha(i); map[k] = o.key; return { ...o, key: k }; });
     return { ...q, options, _map: map };
@@ -8922,7 +9536,7 @@ function App() {
     assigningRef.current = true;
     setAssigningVariant(true);
     try {
-      const exam = await pickVariantForStudent(roomExam, studentName, studentClass);
+      const exam = applyQrCfg(await pickVariantForStudent(roomExam, studentName, studentClass), roomExam.qrCfg);
       setPage({ type: 'examIntro', exam, studentName, studentClass });
     } catch (e) {
       alert('Хувилбар томилох алдаа: ' + (e?.message || 'дахин оролдоно уу'));
@@ -8997,6 +9611,7 @@ function App() {
     prefetchStudentAuth();
     let roomID = null;
     let classKey = '';
+    let cfg = null;
     const hash = window.location.hash;
     if (hash.startsWith('#qr=')) {
       try {
@@ -9006,8 +9621,9 @@ function App() {
         const parsed = unpackExamFromQR(packed);
         roomID = parsed?.roomID || null;
         classKey = parsed?.classKey || '';
+        cfg = parsed?.cfg || null;
         try {
-          sessionStorage.setItem('se_qr_boot', JSON.stringify({ roomID, classKey, t: Date.now() }));
+          sessionStorage.setItem('se_qr_boot', JSON.stringify({ roomID, classKey, cfg, t: Date.now() }));
         } catch {}
         history.replaceState(null, '', appUrlWithHash(''));
       } catch (e) { console.error('QR decode error', e); }
@@ -9018,16 +9634,18 @@ function App() {
         if (boot?.roomID && (Date.now() - (boot.t || 0)) < 120000) {
           roomID = boot.roomID;
           classKey = boot.classKey || window.__SE_QR_PREFETCH__?.classKey || '';
+          cfg = boot.cfg || window.__SE_QR_PREFETCH__?.cfg || null;
         }
       } catch {}
     }
     if (window.__SE_QR_PREFETCH__?.roomID) {
       roomID = roomID || window.__SE_QR_PREFETCH__.roomID;
       classKey = classKey || window.__SE_QR_PREFETCH__.classKey || '';
+      cfg = cfg || window.__SE_QR_PREFETCH__.cfg || null;
     }
     if (roomID) {
       try { sessionStorage.removeItem('se_qr_boot'); } catch {}
-      setPage({ type: 'qrRoom', roomID, qrClassKey: classKey || '' });
+      setPage({ type: 'qrRoom', roomID, qrClassKey: classKey || '', qrCfg: cfg });
     }
   }, []);
 
@@ -9067,9 +9685,9 @@ function App() {
           exam={page.exam}
           studentName={page.studentName}
           studentClass={page.studentClass}
-          account={page.account}
           onSubmit={sub => {
             setSubmissions(s => [...s, sub]);
+            if (page.account && sub.verified) saveAttempt(sub, page.exam, page.account);
             setPage({ type: 'result', submission: sub, exam: page.exam, account: page.account });
           }}
           onBack={() => setPage({ type: 'landing' })}
@@ -9162,6 +9780,7 @@ function App() {
             </div>
             <TeacherDashboard
               exams={exams}
+              onUpdateExam={(ex) => setExams(e => e.map(x => x.id === ex.id ? { ...x, ...ex } : x))}
               submissions={submissions}
               teacherName={page.name}
               onCreateExam={() => setPage({ ...page, type: 'createExam' })}
@@ -9221,7 +9840,7 @@ function App() {
             // Show name screen immediately — refine class label in background
             setPage({
               type: 'qrStudent',
-              exam: { ...roomExam, roomID: roomExam.roomID || page.roomID, qrClassKey: ck, qrClassName: guessed }
+              exam: { ...roomExam, roomID: roomExam.roomID || page.roomID, qrClassKey: ck, qrClassName: guessed, qrCfg: page.qrCfg || null }
             });
             const db = getDb();
             if (ck && db) {
