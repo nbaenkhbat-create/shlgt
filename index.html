@@ -2571,7 +2571,8 @@ const downloadCSV = (filename, rows) => {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 };
 
-const normalizeClassKey = (name) => (name || '').trim().toLowerCase().replace(/\s+/g, '') || '';
+const fbSafeKey = (v) => String(v || '').replace(/[.#$\[\]\/]/g, '_');
+const normalizeClassKey = (name) => fbSafeKey((name || '').trim().toLowerCase().replace(/\s+/g, '')) || '';
 const displayClassName = (key, fallback) => {
   const f = (fallback || key || '').trim();
   return f || '—';
@@ -2725,8 +2726,8 @@ const buildExamWithVariant = (roomExam, label) => {
 };
 
 const studentVariantKey = (roomId, studentName) => {
-  const slug = (studentName || '').trim().toLowerCase().replace(/\s+/g, '_').slice(0, 48);
-  return (deviceId + '_' + roomId + '_' + (slug || 'anon')).slice(0, 120);
+  const slug = fbSafeKey((studentName || '').trim().toLowerCase().replace(/\s+/g, '_')).slice(0, 48);
+  return fbSafeKey(deviceId + '_' + roomId + '_' + (slug || 'anon')).slice(0, 120);
 };
 
 /** Тэнцүү хуваарилалт: 2 хувилбар × 10 сурагч → 5A+5B; 3 × 12 → 4A+4B+4C */
