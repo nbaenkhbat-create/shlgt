@@ -660,9 +660,52 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ================= "admin" багшийн бүртгэлийг Firebase-д автоматаар бэлдэх =================
+// Нэвтрэх нэр: admin  (Firebase дээр admin@smartexam.app), нууц үг: ADMIN_PASSWORD
+async function ensureAdminAccount() {
+  const s = secrets();
+  const pw = String(s.adminPassword || '');
+  if (!s.firebaseApiKey || !s.firebaseDb) return console.log('[admin] firebaseApiKey/firebaseDb тохируулаагүй');
+  if (pw.length < 6) return console.log('[admin] ADMIN_PASSWORD 6+ тэмдэгт байх ёстой, admin бүртгэл үүсгээгүй');
+  const key = encodeURIComponent(s.firebaseApiKey);
+  const email = teacherEmail('admin');
+  const db = String(s.firebaseDb).replace(/\/$/, '');
+  let idToken = '', uid = '', created = false;
+
+  let r = await httpsJson('POST', 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + key,
+    {}, { email, password: pw, returnSecureToken: true });
+  if (r.status === 200 && r.data.idToken) {
+    idToken = r.data.idToken; uid = r.data.localId;
+  } else {
+    r = await httpsJson('POST', 'https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' + key,
+      {}, { email, password: pw, returnSecureToken: true });
+    if (r.status === 200 && r.data.idToken) {
+      idToken = r.data.idToken; uid = r.data.localId; created = true;
+      await httpsJson('POST', 'https://identitytoolkit.googleapis.com/v1/accounts:update?key=' + key,
+        {}, { idToken, displayName: 'Admin', returnSecureToken: false });
+    } else {
+      const msg = (r.data && r.data.error && r.data.error.message) || ('HTTP ' + r.status);
+      if (/EMAIL_EXISTS/.test(msg)) {
+        return console.log('[admin] ' + email + ' Firebase дээр өөр нууц үгтэй байна. Firebase Console → Authentication → Users дээрээс устгаад серверийг дахин асаа (эсвэл нууц үгийг нь ADMIN_PASSWORD-той ижил болго)');
+      }
+      return console.log('[admin] бүртгэл үүсгэж чадсангүй: ' + msg);
+    }
+  }
+
+  // Профайл (users/, teachers/) байхгүй бол бичнэ
+  const tq = '.json?auth=' + encodeURIComponent(idToken);
+  const have = await httpsJson('GET', db + '/teachers/' + uid + tq);
+  if (!have.data) {
+    await httpsJson('PUT', db + '/users/' + uid + tq, {}, { role: 'teacher', name: 'Admin', login: 'admin', email, createdBy: 'server' });
+    await httpsJson('PUT', db + '/teachers/' + uid + tq, {}, { displayName: 'Admin', email, login: 'admin', createdAt: new Date().toISOString() });
+  }
+  console.log('[admin] ✓ бэлэн: нэвтрэх нэр "admin"' + (created ? ' (шинээр үүсгэлээ)' : ''));
+}
+
 server.listen(PORT, HOST, () => {
   const ips = lanIps();
   console.log('SmartEXAM LAN host');
+  ensureAdminAccount().catch((e) => console.log('[admin] алдаа: ' + e.message));
   console.log('  Local:  http://127.0.0.1:' + PORT + '/');
   ips.forEach((ip) => console.log('  LAN:    http://' + ip + ':' + PORT + '/'));
   console.log('  Admin:  http://' + (ips[0] || '127.0.0.1') + ':' + PORT + '/admin-by-e-c-1771');
